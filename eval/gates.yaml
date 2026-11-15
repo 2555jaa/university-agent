@@ -1,0 +1,25 @@
+version: 1
+
+retrieval:
+  k: 5
+  min_precision_at_k: 0.70
+  min_recall_at_k: 0.80
+
+citations:
+  required_reference_accuracy: 1.00
+  fabricated_citations_allowed: 0
+
+answer_quality:
+  min_no_answer_accuracy: 0.90
+  min_supported_claim_accuracy: 0.90
+
+regression:
+  max_precision_drop: 0.05
+  max_recall_drop: 0.05
+  max_no_answer_accuracy_drop: 0.05
+
+dataset:
+  require_tuning_split: true
+  require_held_out_split: true
+  require_document_level_separation: true
+  require_category_counts: true
