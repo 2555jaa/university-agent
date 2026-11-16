@@ -1,0 +1,70 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+.venv/
+.venv312/
+env/
+venv/
+ENV/
+
+# Data & Persistence
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.sqlite-*
+data/*.log
+data/chroma/
+data/backups/
+data/evaluation_results.json
+data/documents/*
+!data/documents/.gitkeep
+
+# Environment & Secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+credentials.*
+secrets.*
+
+# User workspace files
+workspace/*
+!workspace/.gitkeep
+.env.*
+!.env.example
+
+# Backups and Logs
+*.bak
+*.bak.*
+*.log
+logs/
+workspace/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/

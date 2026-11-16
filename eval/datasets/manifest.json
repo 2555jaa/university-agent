@@ -1,0 +1,78 @@
+{
+  "dataset_version": "phase4-candidate-v1",
+  "status": "candidate_requires_human_review",
+  "questions_are_synthetic_candidates": true,
+  "human_verified_ground_truth": false,
+  "held_out_evaluation_run": false,
+  "tuning_parameters_may_be_selected_from_held_out": false,
+  "document_level_separation_verified": true,
+  "splits": {
+    "tuning": {
+      "question_count": 10,
+      "answerable_count": 7,
+      "no_answer_count": 3,
+      "category_counts": {
+        "ambiguous_terminology": 1,
+        "exact_factual": 3,
+        "misleading_information": 1,
+        "multiple_sections": 1,
+        "no_answer_fictitious_entity": 1,
+        "paraphrased": 2,
+        "wrong_subject": 1
+      },
+      "source_document_ids": [
+        "8870e58d-3590-4784-858d-0c6b406012c0",
+        "e01451f7-0c9f-4b09-96f9-7db69b2aa979"
+      ],
+      "sha256": "168c12e431bd3c1219f65427346c40220f0a7053e2208866a1ced6faaf833bdb"
+    },
+    "held_out": {
+      "question_count": 17,
+      "answerable_count": 12,
+      "no_answer_count": 5,
+      "category_counts": {
+        "ambiguous_terminology": 1,
+        "exact_factual": 5,
+        "misleading_information": 2,
+        "multi_page": 1,
+        "multiple_sections": 1,
+        "no_answer_absent_detail": 1,
+        "no_answer_unrelated": 1,
+        "paraphrased": 2,
+        "prompt_injection_document": 1,
+        "wrong_subject": 2
+      },
+      "source_document_ids": [
+        "7bea3bc4-c6d6-4010-8853-9d3f34249dec",
+        "b4a9f496-e43a-44d1-a98c-2ba056593055"
+      ],
+      "sha256": "843ee10951fee75b673b8c0148f21aa9c8a896d4a9613e80d989808ef1ffda93"
+    }
+  },
+  "source_documents": [
+    {
+      "filename": "ai_governance.docx",
+      "sha256": "a777aa64f62ae892727331b29b6d658c469e947d51bc4d6a6176979ae60b3b16",
+      "document_id": "8870e58d-3590-4784-858d-0c6b406012c0",
+      "split": "tuning"
+    },
+    {
+      "filename": "discrete_math.txt",
+      "sha256": "63ca072e831e7d42fa4da6640fb3bf4b91acf654d2fe2f07f09a1f6ce4c9d381",
+      "document_id": "e01451f7-0c9f-4b09-96f9-7db69b2aa979",
+      "split": "tuning"
+    },
+    {
+      "filename": "os_virtual_memory.pdf",
+      "sha256": "7bc7b167ef200f867d4bbc1088fca2c3497634d1026169729d55e52bf7b7c5e2",
+      "document_id": "7bea3bc4-c6d6-4010-8853-9d3f34249dec",
+      "split": "held_out"
+    },
+    {
+      "filename": "physics_constants.pdf",
+      "sha256": "32e88ae45666e39778b9d7c382495c6e033ed8f4f680fdd40c951d670ec28e73",
+      "document_id": "b4a9f496-e43a-44d1-a98c-2ba056593055",
+      "split": "held_out"
+    }
+  ]
+}

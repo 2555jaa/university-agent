@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#070b10">
+  <meta name="description" content="A private, local-first academic assistant">
+  <title>University Agent</title>
+  <link rel="stylesheet" href="/static/app.css">
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+  <div class="app-shell">
+    <div class="mobile-scrim" id="mobile-scrim" hidden></div>
+    <aside class="sidebar" id="sidebar" aria-label="Main navigation">
+      <a class="brand" href="/" aria-label="University Agent home">
+        <span class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></span>
+        <span class="brand-copy"><strong>UNIVERSITY</strong><small>AGENT / LOCAL</small></span>
+      </a>
+
+      <button class="new-chat-button" id="new-chat" type="button">
+        <span class="plus-icon" aria-hidden="true">+</span><span>New chat</span>
+        <kbd>⌘ K</kbd>
+      </button>
+
+      <nav class="primary-nav" aria-label="Workspace">
+        <button class="nav-item active" data-view="chat" type="button" aria-current="page">
+          <span class="nav-icon" aria-hidden="true">⌁</span><span>Chat</span>
+        </button>
+        <button class="nav-item" data-view="knowledge" type="button">
+          <span class="nav-icon" aria-hidden="true">▤</span><span>Knowledge</span>
+        </button>
+        <button class="nav-item" data-view="learning" type="button">
+          <span class="nav-icon" aria-hidden="true">◷</span><span>Learning</span>
+        </button>
+      </nav>
+
+      <div class="sidebar-section recent-section">
+        <div class="section-label"><span>RECENT</span><span class="section-line"></span></div>
+        <div class="recent-list" id="recent-list" aria-label="Recent conversations"></div>
+        <p class="empty-recent" id="empty-recent">Your conversations will appear here.</p>
+      </div>
+
+      <div class="sidebar-bottom">
+        <div class="local-note"><span class="tiny-shield" aria-hidden="true">◇</span><span>Local-first workspace</span></div>
+        <button class="nav-item settings-link" data-view="settings" type="button">
+          <span class="nav-icon" aria-hidden="true">⚙</span><span>Settings & approvals</span>
+        </button>
+        <a class="docs-link" href="/docs" target="_blank" rel="noreferrer">API documentation <span aria-hidden="true">↗</span></a>
+      </div>
+    </aside>
+
+    <main class="main-shell">
+      <header class="topbar">
+        <button class="icon-button menu-button" id="menu-toggle" type="button" aria-label="Open navigation" aria-expanded="false">☰</button>
+        <div class="breadcrumb"><span class="crumb-mark" aria-hidden="true">/</span><span id="page-title">Chat</span></div>
+        <div class="topbar-right">
+          <div class="system-status" id="system-status" aria-live="polite">
+            <span class="status-dot checking" id="status-dot"></span>
+            <span id="status-label">Checking local system</span>
+          </div>
+          <button class="avatar-button" id="status-details" type="button" aria-label="Open system status">UA</button>
+        </div>
+      </header>
+
+      <section class="view chat-view" id="chat-view" aria-label="Chat with University Agent">
+        <div class="conversation" id="conversation">
+          <div class="welcome" id="welcome">
+            <div class="welcome-orbit" aria-hidden="true"><div class="orbit-core"><span>U</span></div><i></i><b></b></div>
+            <p class="eyebrow"><span class="eyebrow-line"></span> YOUR ACADEMIC COPILOT <span class="eyebrow-line"></span></p>
+            <h1>What are you<br><em>working through?</em></h1>
+            <p class="welcome-copy">Ask a question, explore a concept, or work with your course material.</p>
+            <div class="prompt-grid" aria-label="Example prompts">
+              <button class="prompt-card" type="button" data-prompt="Explain a difficult concept step by step">
+                <span class="prompt-icon green" aria-hidden="true">↗</span><span><strong>Unpack a concept</strong><small>Break a difficult idea into steps</small></span><span class="prompt-arrow" aria-hidden="true">↗</span>
+              </button>
+              <button class="prompt-card" type="button" data-prompt="Help me understand my course notes">
+                <span class="prompt-icon cyan" aria-hidden="true">⌕</span><span><strong>Explore your notes</strong><small>Get answers grounded in your files</small></span><span class="prompt-arrow" aria-hidden="true">↗</span>
+              </button>
+              <button class="prompt-card" type="button" data-prompt="Help me plan a focused study session">
+                <span class="prompt-icon violet" aria-hidden="true">◷</span><span><strong>Plan a study session</strong><small>Make a clear next-step plan</small></span><span class="prompt-arrow" aria-hidden="true">↗</span>
+              </button>
+            </div>
+          </div>
+          <div class="message-list" id="message-list" role="log" aria-live="polite" aria-relevant="additions text"></div>
+        </div>
+
+        <div class="composer-wrap">
+          <form class="composer" id="composer">
+            <label class="sr-only" for="message-input">Message University Agent</label>
+            <textarea id="message-input" rows="1" maxlength="12000" placeholder="Ask the University Agent…"></textarea>
+            <div class="composer-toolbar">
+              <div class="composer-tools">
+                <label class="attach-button" for="document-input" title="Upload a course document">
+                  <span aria-hidden="true">＋</span><span class="attach-label">Attach</span>
+                </label>
+                <input id="document-input" type="file" accept=".pdf,.docx,.doc,.txt,.md" hidden>
+                <span class="tool-divider" aria-hidden="true"></span>
+                <label class="mode-label" for="mode-select">Mode</label>
+                <select id="mode-select" aria-label="Assistant mode">
+                  <option value="tutor">Tutor</option>
+                  <option value="research">Research</option>
+                  <option value="assignment">Planner</option>
+                  <option value="assistant">General</option>
+                </select>
+              </div>
+              <div class="composer-actions">
+                <span class="key-hint"><kbd>Enter</kbd> to send</span>
+                <button class="send-button" id="send-button" type="submit" aria-label="Send message"><span>Send</span><span aria-hidden="true">↑</span></button>
+              </div>
+            </div>
+          </form>
+          <p class="composer-footnote">Responses can make mistakes. Check important details against your sources.</p>
+        </div>
+      </section>
+
+      <section class="view content-view" id="knowledge-view" hidden aria-labelledby="knowledge-heading">
+        <div class="content-heading"><p class="eyebrow">YOUR REFERENCE LIBRARY</p><h1 id="knowledge-heading">Knowledge base</h1><p>Course files available to ground your answers.</p></div>
+        <div class="upload-zone" id="upload-zone">
+          <div class="upload-icon" aria-hidden="true">⇧</div>
+          <div><strong>Add course material</strong><p>PDF, DOCX, TXT or Markdown. Files are processed locally.</p></div>
+          <label class="secondary-button" for="library-file-input">Choose file</label>
+          <input id="library-file-input" type="file" accept=".pdf,.docx,.doc,.txt,.md" hidden>
+        </div>
+        <div class="library-toolbar"><span class="section-label">INDEXED DOCUMENTS</span><button class="text-button" id="refresh-documents" type="button">Refresh</button></div>
+        <div class="document-list" id="document-list"><div class="loading-row">Loading your library…</div></div>
+        <p class="view-note" id="library-note"></p>
+      </section>
+
+      <section class="view content-view" id="learning-view" hidden aria-labelledby="learning-heading">
+        <div class="content-heading"><p class="eyebrow">YOUR STUDY SPACE</p><h1 id="learning-heading">Learning progress</h1><p>A quiet snapshot of your recorded learning activity.</p></div>
+        <div class="learning-stats" id="learning-stats"><div class="loading-row">Loading your progress…</div></div>
+        <div class="learning-columns">
+          <section class="subpanel"><div class="panel-heading"><h2>Topics</h2><span class="panel-mark" aria-hidden="true">01</span></div><div id="topic-list" class="topic-list"></div></section>
+          <section class="subpanel"><div class="panel-heading"><h2>Study tasks</h2><span class="panel-mark" aria-hidden="true">02</span></div><div id="task-list" class="task-list"></div></section>
+        </div>
+      </section>
+
+      <section class="view content-view" id="settings-view" hidden aria-labelledby="settings-heading">
+        <div class="content-heading"><p class="eyebrow">LOCAL SYSTEM</p><h1 id="settings-heading">System & approvals</h1><p>Live service information and actions awaiting your decision.</p></div>
+        <section class="subpanel status-panel"><div class="panel-heading"><h2>System status</h2><button class="text-button" id="refresh-status" type="button">Refresh</button></div><div id="system-details" class="system-details"><div class="loading-row">Checking services…</div></div></section>
+        <section class="subpanel approvals-panel"><div class="panel-heading"><h2>Pending approvals</h2><span class="panel-mark" id="approval-count">—</span></div><div id="approval-list" class="approval-list"><div class="loading-row">Loading approvals…</div></div></section>
+      </section>
+
+      <div class="toast" id="toast" role="status" aria-live="polite"></div>
+    </main>
+  </div>
+</body>
+</html>
