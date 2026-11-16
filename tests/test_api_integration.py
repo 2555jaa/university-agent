@@ -1,5 +1,7 @@
 """Integration tests for FastAPI endpoints, RAG upload, and Open WebUI OpenAI compatibility."""
 
+import json
+from unittest.mock import patch
 import pytest
 
 
@@ -159,3 +161,339 @@ async def test_document_upload_validation_and_rejections(async_client):
         files={"file": (".env", b"SECRET=123", "text/plain")}
     )
     assert res3.status_code in (400, 403)
+
+
+@pytest.mark.asyncio
+async def test_chat_sse_streaming_endpoint(async_client, test_app):
+    """Verify that POST /api/chat streams SSE events with tokens and final completion metadata."""
+    container = test_app.state.services
+
+    async def mock_stream(req):
+        yield {"token": "Binary ", "session_id": req.session_id or "sess-1"}
+        yield {"token": "search trees", "session_id": req.session_id or "sess-1"}
+        yield {
+            "done": True,
+            "session_id": req.session_id or "sess-1",
+            "message_id": "msg-123",
+            "reply": "Binary search trees",
+            "metadata": {
+                "used_sources": [{"filename": "trees.txt", "chunk_id": "[1]"}],
+                "reasoning_path": "Reasoning step 1",
+                "intent": "TUTORING"
+            }
+        }
+
+    with patch.object(container.agent, "process_query_stream", side_effect=mock_stream):
+        payload = {
+            "session_id": "sess-1",
+            "messages": [{"role": "user", "content": "Explain binary search trees step by step"}],
+            "mode": "tutor"
+        }
+        res = await async_client.post("/api/chat", json=payload)
+        assert res.status_code == 200
+        assert "text/event-stream" in res.headers.get("content-type", "")
+
+        lines = [line.strip() for line in res.text.split("\n") if line.strip().startswith("data:")]
+        assert len(lines) >= 3
+
+        events = [json.loads(line[len("data:"):].strip()) for line in lines]
+        tokens = [e["token"] for e in events if "token" in e]
+        assert "Binary " in tokens
+        assert "search trees" in tokens
+
+        final_event = next(e for e in events if e.get("done") is True)
+        assert final_event["session_id"] == "sess-1"
+        assert "metadata" in final_event
+        assert final_event["metadata"]["intent"] == "TUTORING"
+        assert len(final_event["metadata"]["used_sources"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_agent_chat_alias_sse_streaming(async_client, test_app):
+    """Verify that POST /api/agent/chat alias streams SSE events cleanly."""
+    container = test_app.state.services
+
+    async def mock_stream(req):
+        yield {"token": "Hello ", "session_id": req.session_id}
+        yield {"token": "student!", "session_id": req.session_id}
+        yield {
+            "done": True,
+            "session_id": req.session_id,
+            "reply": "Hello student!",
+            "metadata": {"used_sources": [], "reasoning_path": None, "intent": "DEFAULT_QA"}
+        }
+
+    with patch.object(container.agent, "process_query_stream", side_effect=mock_stream):
+        payload = {
+            "session_id": "sess-alias",
+            "message": "Hello!",
+            "mode": "tutor"
+        }
+        res = await async_client.post("/api/agent/chat", json=payload)
+        assert res.status_code == 200
+        assert "text/event-stream" in res.headers.get("content-type", "")
+        lines = [line.strip() for line in res.text.split("\n") if line.strip().startswith("data:")]
+        events = [json.loads(line[len("data:"):].strip()) for line in lines]
+        assert any("token" in e for e in events)
+        assert any(e.get("done") is True for e in events)
+
+
+@pytest.mark.asyncio
+async def test_chat_sse_streaming_error_handling(async_client, test_app):
+    """Verify that mid-stream or upfront errors yield an SSE error block without crashing the connection."""
+    container = test_app.state.services
+
+    async def mock_stream_error(req):
+        yield {"token": "Starting...", "session_id": req.session_id}
+        raise RuntimeError("Inference connection reset by peer")
+
+    with patch.object(container.agent, "process_query_stream", side_effect=mock_stream_error):
+        payload = {
+            "session_id": "sess-err",
+            "message": "Simulate error",
+        }
+        res = await async_client.post("/api/chat", json=payload)
+        assert res.status_code == 200
+        assert "text/event-stream" in res.headers.get("content-type", "")
+        lines = [line.strip() for line in res.text.split("\n") if line.strip().startswith("data:")]
+        events = [json.loads(line[len("data:"):].strip()) for line in lines]
+        error_event = next(e for e in events if "error" in e)
+        assert "Inference connection reset by peer" in error_event["error"]
+        assert error_event.get("done") is True
+
+
+@pytest.mark.asyncio
+async def test_agent_quiz_endpoint(async_client, test_app):
+    """Verify that POST /api/agent/quiz returns structured multiple-choice quiz JSON."""
+    container = test_app.state.services
+    mock_quiz = {
+        "topic": "Binary Search Trees",
+        "questions": [
+            {
+                "question_text": "What is the average lookup time in a balanced BST?",
+                "options": ["O(1)", "O(log n)", "O(n)", "O(n^2)"],
+                "correct_answer": None,
+                "explanation": None,
+                "source_chunk_id": "[1]",
+                "source_metadata": {"filename": "bst.pdf", "page_number": 3}
+            }
+        ],
+        "status": "success",
+        "total_questions": 1,
+        "answers_hidden": True
+    }
+    with patch.object(container.agent, "generate_quiz", return_value=mock_quiz) as mock_gen:
+        quiz_payload = {
+            "subject_id": "CS101",
+            "topic": "Binary Search Trees",
+            "num_questions": 1,
+            "hide_answers": True
+        }
+        res = await async_client.post("/api/agent/quiz", json=quiz_payload)
+        assert res.status_code == 200
+        data = res.json()
+        assert data["topic"] == "Binary Search Trees"
+        assert len(data["questions"]) == 1
+        assert data["answers_hidden"] is True
+        mock_gen.assert_called_once_with(
+            subject_id="CS101",
+            topic="Binary Search Trees",
+            num_questions=1,
+            hide_answers=True,
+            topic_id=None,
+            topic_name=None
+        )
+
+
+@pytest.mark.asyncio
+async def test_memory_sessions_and_history_endpoints(async_client, test_app):
+    """Verify GET /api/memory/sessions and GET /api/memory/sessions/{session_id} retrieve persisted history."""
+    container = test_app.state.services
+    db = container.db
+
+    session_id_1 = "session-mem-1"
+    session_id_2 = "session-mem-2"
+
+    await db.create_session(session_id=session_id_1, session_type="tutor", title="Tutor Session 1")
+    await db.create_session(session_id=session_id_2, session_type="research", title="Research Session 2")
+
+    await db.save_message(
+        session_id=session_id_1,
+        role="user",
+        content="What is quicksort?",
+        mode="tutor"
+    )
+    await db.save_message(
+        session_id=session_id_1,
+        role="assistant",
+        content="Quicksort is a divide-and-conquer sorting algorithm.",
+        mode="tutor",
+        metadata={"used_sources": [{"filename": "sort.pdf"}], "intent": "TUTORING"}
+    )
+
+    # 1. Test GET /api/memory/sessions
+    res_sessions = await async_client.get("/api/memory/sessions?limit=10")
+    assert res_sessions.status_code == 200
+    sessions_list = res_sessions.json()
+    assert isinstance(sessions_list, list)
+    session_ids = [s["id"] for s in sessions_list]
+    assert session_id_1 in session_ids
+    assert session_id_2 in session_ids
+
+    # 2. Test GET /api/memory/sessions/{session_id}
+    res_history = await async_client.get(f"/api/memory/sessions/{session_id_1}")
+    assert res_history.status_code == 200
+    history = res_history.json()
+    assert len(history) == 2
+    assert history[0]["role"] == "user"
+    assert history[0]["content"] == "What is quicksort?"
+    assert history[1]["role"] == "assistant"
+    assert history[1]["content"] == "Quicksort is a divide-and-conquer sorting algorithm."
+    assert "metadata" in history[1]
+    assert history[1]["metadata"]["intent"] == "TUTORING"
+
+
+@pytest.mark.asyncio
+async def test_subject_and_topic_crud_api(async_client, test_app):
+    """Verify creating a subject via API, listing subjects, and adding/listing topics under that subject."""
+    # 1. Create a subject via POST /api/subjects
+    sub_payload = {
+        "name": "Distributed Systems",
+        "code": "CS401",
+        "description": "Consensus, replication, and fault tolerance."
+    }
+    create_res = await async_client.post("/api/subjects", json=sub_payload)
+    assert create_res.status_code == 200
+    sub_data = create_res.json()
+    assert sub_data["name"] == "Distributed Systems"
+    assert sub_data["code"] == "CS401"
+    sub_id = sub_data["id"]
+
+    # 2. Retrieve via GET /api/subjects
+    list_res = await async_client.get("/api/subjects")
+    assert list_res.status_code == 200
+    subjects = list_res.json()
+    assert any(s["id"] == sub_id for s in subjects)
+
+    # 3. Add topic to this subject via POST /api/subjects/{subject_id}/topics
+    topic_payload = {
+        "name": "Raft Consensus",
+        "mastery_level": 0.85,
+        "notes": "Leader election and log replication."
+    }
+    t_create_res = await async_client.post(f"/api/subjects/{sub_id}/topics", json=topic_payload)
+    assert t_create_res.status_code == 200
+    t_data = t_create_res.json()
+    assert t_data["name"] == "Raft Consensus"
+    assert t_data["mastery_level"] == 0.85
+
+    # 4. List topics via GET /api/subjects/{subject_id}/topics
+    t_list_res = await async_client.get(f"/api/subjects/{sub_id}/topics")
+    assert t_list_res.status_code == 200
+    topics = t_list_res.json()
+    assert len(topics) >= 1
+    assert any(t["name"] == "Raft Consensus" for t in topics)
+
+
+@pytest.mark.asyncio
+async def test_add_topic_to_nonexistent_subject_returns_error(async_client, test_app):
+    """Verify attempting to add a topic to a non-existent subject returns 400 or 404."""
+    topic_payload = {
+        "name": "Quantum Entanglement",
+        "mastery_level": 0.5
+    }
+    res = await async_client.post("/api/subjects/non-existent-sub-id-9999/topics", json=topic_payload)
+    assert res.status_code in (400, 404)
+    data = res.json()
+    assert "detail" in data or "error" in data
+
+
+@pytest.mark.asyncio
+async def test_upcoming_and_overdue_tasks_api(async_client, test_app):
+    """Verify fetching upcoming and overdue tasks via API returns valid lists."""
+    # 1. Create a task due soon (upcoming)
+    upcoming_task = {
+        "title": "Complete Lab 3",
+        "description": "Socket programming lab",
+        "deadline": "2026-11-20T23:59:59Z",
+        "priority": "high"
+    }
+    t1_res = await async_client.post("/api/tasks", json=upcoming_task)
+    assert t1_res.status_code == 200
+    t1_id = t1_res.json()["id"]
+
+    # 2. Create an overdue task
+    overdue_task = {
+        "title": "Past Assignment 1",
+        "description": "Old assignment",
+        "deadline": "2020-01-01T00:00:00Z",
+        "priority": "medium"
+    }
+    t2_res = await async_client.post("/api/tasks", json=overdue_task)
+    assert t2_res.status_code == 200
+    t2_id = t2_res.json()["id"]
+
+    # 3. GET /api/tasks/upcoming
+    up_res = await async_client.get("/api/tasks/upcoming?days_ahead=30")
+    assert up_res.status_code == 200
+    up_tasks = up_res.json()
+    assert isinstance(up_tasks, list)
+
+    # 4. GET /api/tasks/overdue
+    od_res = await async_client.get("/api/tasks/overdue")
+    assert od_res.status_code == 200
+    od_tasks = od_res.json()
+    assert isinstance(od_tasks, list)
+    assert any(t["id"] == t2_id for t in od_tasks)
+
+
+@pytest.mark.asyncio
+async def test_study_goals_api_and_clamped_progress(async_client, test_app):
+    """Verify creating study goals and updating progress clamps [0, 100] and auto-completes at 100%."""
+    # 1. Create goal via POST /api/goals
+    goal_payload = {
+        "title": "Master Computer Architecture",
+        "description": "Cover pipeline hazards and caches",
+        "target_date": "2026-12-31",
+        "progress_percent": 25.0
+    }
+    create_res = await async_client.post("/api/goals", json=goal_payload)
+    assert create_res.status_code == 200
+    goal_data = create_res.json()
+    assert goal_data["title"] == "Master Computer Architecture"
+    assert goal_data["progress_percent"] == 25.0
+    goal_id = goal_data["id"]
+
+    # 2. List goals via GET /api/goals
+    list_res = await async_client.get("/api/goals")
+    assert list_res.status_code == 200
+    goals = list_res.json()
+    assert any(g["id"] == goal_id for g in goals)
+
+    # 3. Update progress exceeding 100% -> should clamp to 100.0 and mark status 'completed'
+    patch_res = await async_client.patch(f"/api/goals/{goal_id}/progress", json={"progress_percent": 150.0})
+    assert patch_res.status_code == 200
+    updated_goal = patch_res.json()
+    assert updated_goal["progress_percent"] == 100.0
+    assert updated_goal["status"] == "completed"
+
+    # 4. Update progress below 0% -> should clamp to 0.0
+    patch_res_neg = await async_client.patch(f"/api/goals/{goal_id}/progress", json={"progress_percent": -20.0})
+    assert patch_res_neg.status_code == 200
+    assert patch_res_neg.json()["progress_percent"] == 0.0
+
+    # 5. Non-existent goal returns 404
+    bad_res = await async_client.patch("/api/goals/non-existent-goal-999/progress", json={"progress_percent": 50.0})
+    assert bad_res.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_document_listing_with_subject_filter(async_client, test_app):
+    """Verify GET /api/documents returns documents and filters by subject_id."""
+    res = await async_client.get("/api/documents")
+    assert res.status_code == 200
+    assert isinstance(res.json(), list)
+
+    res_filtered = await async_client.get("/api/documents?subject_id=NonExistentSubject")
+    assert res_filtered.status_code == 200
+    assert res_filtered.json() == []

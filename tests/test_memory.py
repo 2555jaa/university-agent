@@ -162,3 +162,105 @@ async def test_save_message_rich_metadata_serialization_and_recent_sessions(memo
     recent = await memory_db.get_recent_sessions(limit=5)
     assert len(recent) >= 1
     assert any(s["id"] == sess_id for s in recent)
+
+
+@pytest.mark.asyncio
+async def test_record_quiz_result_ema_and_last_reviewed(memory_db):
+    """Verify record_quiz_result updates topic mastery via EMA and bumps last_reviewed."""
+    await memory_db.add_subject("subj_os", "Operating Systems")
+    await memory_db.add_or_update_topic("top_sync", "subj_os", "Process Synchronization", mastery=0.5)
+
+    # First quiz with score 1.0: (0.5 * 0.7) + (1.0 * 0.3) = 0.35 + 0.30 = 0.65
+    res1 = await memory_db.record_quiz_result(
+        subject_id="subj_os",
+        topic_id="top_sync",
+        score=1.0,
+        total_questions=5
+    )
+    assert res1["mastery_level"] == 0.65
+
+    topics = await memory_db.list_topics("subj_os")
+    assert len(topics) == 1
+    assert topics[0]["mastery_level"] == 0.65
+    assert topics[0]["last_reviewed"] is not None
+
+    # Second quiz with score 0.5: (0.65 * 0.7) + (0.5 * 0.3) = 0.455 + 0.15 = 0.605
+    res2 = await memory_db.record_quiz_result(
+        subject_id="subj_os",
+        topic_id="top_sync",
+        score=0.5,
+        total_questions=4
+    )
+    assert res2["mastery_level"] == 0.605
+
+    topics2 = await memory_db.list_topics("subj_os")
+    assert topics2[0]["mastery_level"] == 0.605
+
+
+@pytest.mark.asyncio
+async def test_upcoming_and_overdue_tasks_filtering(memory_db):
+    """Verify get_upcoming_tasks and get_overdue_tasks filter by status and chronological deadlines."""
+    from datetime import datetime, timezone, timedelta
+
+    now = datetime.now(timezone.utc)
+    t_tomorrow = (now + timedelta(days=1)).isoformat()
+    t_in_three_days = (now + timedelta(days=3)).isoformat()
+    t_in_twenty_days = (now + timedelta(days=20)).isoformat()
+    t_yesterday = (now - timedelta(days=1)).isoformat()
+
+    # 1. Upcoming task due tomorrow (pending)
+    await memory_db.add_task("task_due_tomorrow", "Review Lecture 3", deadline=t_tomorrow)
+
+    # 2. Upcoming task due in 3 days (in_progress)
+    await memory_db.add_task("task_due_3days", "Lab 2 submission", deadline=t_in_three_days)
+    await memory_db.update_task_status("task_due_3days", "in_progress")
+
+    # 3. Completed task due tomorrow (should be excluded from upcoming)
+    await memory_db.add_task("task_completed_tomorrow", "Quiz 1 Prep", deadline=t_tomorrow)
+    await memory_db.update_task_status("task_completed_tomorrow", "completed")
+
+    # 4. Distant task due in 20 days (should be excluded from 7-day window)
+    await memory_db.add_task("task_distant", "Final Exam Study", deadline=t_in_twenty_days)
+
+    # 5. Overdue task due yesterday (pending)
+    await memory_db.add_task("task_overdue", "Homework 1", deadline=t_yesterday)
+
+    # Query upcoming tasks within 7 days
+    upcoming = await memory_db.get_upcoming_tasks(days_ahead=7)
+    upcoming_ids = [t["id"] for t in upcoming]
+
+    assert len(upcoming) == 2
+    assert upcoming_ids == ["task_due_tomorrow", "task_due_3days"]
+    # Verify sorting by closest deadline ascending
+    assert upcoming[0]["deadline"] < upcoming[1]["deadline"]
+
+    # Query overdue tasks
+    overdue = await memory_db.get_overdue_tasks()
+    assert len(overdue) == 1
+    assert overdue[0]["id"] == "task_overdue"
+
+
+@pytest.mark.asyncio
+async def test_update_goal_progress_clamping_and_auto_completion(memory_db):
+    """Verify update_goal_progress clamps progress percentage and automatically marks goal completed at 100%."""
+    goal = await memory_db.add_study_goal(
+        goal_id="goal_ml",
+        title="Complete Machine Learning Specialization",
+        progress_percent=25.0
+    )
+    assert goal["status"] == "in_progress"
+    assert goal["progress_percent"] == 25.0
+
+    # 1. Update progress to 60%
+    u1 = await memory_db.update_goal_progress("goal_ml", 60.0)
+    assert u1["progress_percent"] == 60.0
+    assert u1["status"] == "in_progress"
+
+    # 2. Update progress with out-of-range value (> 100%) -> clamps to 100% and auto-completes
+    u2 = await memory_db.update_goal_progress("goal_ml", 140.0)
+    assert u2["progress_percent"] == 100.0
+    assert u2["status"] == "completed"
+
+    # 3. Verify get_active_goals excludes completed goal
+    active_goals = await memory_db.get_active_goals()
+    assert not any(g["id"] == "goal_ml" for g in active_goals)

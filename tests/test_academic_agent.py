@@ -413,3 +413,76 @@ def test_prune_chat_history_unit():
     contents = [m.content for m in messages]
     assert any("Turn 20" in c for c in contents)
     assert not any("Turn 1 " in c for c in contents)
+
+
+@pytest.mark.asyncio
+async def test_evaluate_quiz_accurately_scores_four_questions(tmp_path):
+    """Verify evaluate_quiz correctly scores a simulated 4-question quiz (3 correct = 0.75) and updates mastery."""
+    from app.memory.database import DatabaseManager
+    test_db = DatabaseManager(db_path=tmp_path / "test_eval_quiz.db")
+    agent = AcademicAgent(db_instance=test_db)
+
+    await test_db.add_subject("cs_sys", "Computer Systems")
+    await test_db.add_or_update_topic("top_os_concepts", "cs_sys", "Core OS Concepts", mastery=0.5)
+
+    quiz_data = {
+        "topic": "Core OS Concepts",
+        "questions": [
+            {
+                "question_text": "What causes a page fault?",
+                "options": ["A) Accessing an unmapped virtual address", "B) Disk failure", "C) CPU overheating", "D) Network disconnect"],
+                "correct_answer": "A) Accessing an unmapped virtual address",
+                "explanation": "Page faults happen when a referenced page is not in physical memory.",
+                "source_chunk_id": "[1]"
+            },
+            {
+                "question_text": "Which scheduling algorithm is non-preemptive?",
+                "options": ["A) Round Robin", "B) First-Come First-Served (FCFS)", "C) Shortest Remaining Time First", "D) Priority Preemptive"],
+                "correct_answer": "B) First-Come First-Served (FCFS)",
+                "explanation": "FCFS processes requests strictly in order of arrival without preemption.",
+                "source_chunk_id": "[2]"
+            },
+            {
+                "question_text": "What is a condition required for deadlock?",
+                "options": ["A) Mutual Exclusion", "B) Preemption allowed", "C) No resource sharing", "D) Single thread"],
+                "correct_answer": "A) Mutual Exclusion",
+                "explanation": "Deadlock requires mutual exclusion, hold and wait, no preemption, and circular wait.",
+                "source_chunk_id": "[3]"
+            },
+            {
+                "question_text": "What synchronization primitive prevents race conditions?",
+                "options": ["A) Semaphore", "B) Cache miss", "C) Page table", "D) TLB buffer"],
+                "correct_answer": "A) Semaphore",
+                "explanation": "Semaphores provide mutual exclusion to shared critical sections.",
+                "source_chunk_id": "[4]"
+            }
+        ]
+    }
+
+    # Student chooses 3 correct answers and 1 incorrect answer
+    student_answers = {
+        "0": "A) Accessing an unmapped virtual address",  # Correct
+        "1": "B",                                         # Correct (option letter)
+        "2": "A) Mutual Exclusion",                       # Correct
+        "3": "C) Page table"                              # Incorrect (correct is A)
+    }
+
+    res = await agent.evaluate_quiz(
+        topic_id="top_os_concepts",
+        answers=student_answers,
+        quiz_data=quiz_data
+    )
+
+    assert res["score"] == 0.75
+    assert res["total_questions"] == 4
+    assert res["correct_count"] == 3
+    assert len(res["evaluations"]) == 4
+
+    assert res["evaluations"][0]["is_correct"] is True
+    assert res["evaluations"][1]["is_correct"] is True
+    assert res["evaluations"][2]["is_correct"] is True
+    assert res["evaluations"][3]["is_correct"] is False
+
+    # Check topic mastery was updated via EMA: (0.5 * 0.7) + (0.75 * 0.3) = 0.35 + 0.225 = 0.575
+    topic = await test_db.get_topic_by_name("cs_sys", "Core OS Concepts")
+    assert topic["mastery_level"] == 0.575

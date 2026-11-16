@@ -42,6 +42,7 @@ def _migration_001_initial_schema(conn: sqlite3.Connection) -> None:
         name TEXT NOT NULL,
         mastery_level REAL DEFAULT 0.0,
         notes TEXT,
+        last_reviewed TEXT,
         updated_at TEXT NOT NULL,
         FOREIGN KEY(subject_id) REFERENCES subjects(id) ON DELETE CASCADE
     );
@@ -126,7 +127,9 @@ def _migration_002_constraints_and_indexes(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_subjects_name_lower ON subjects(LOWER(name));")
     conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_subjects_code_lower ON subjects(LOWER(code)) WHERE code IS NOT NULL;")
 
-    # 2. topics: mastery check and unique (subject_id, name)
+    # 2. topics: mastery check, last_reviewed column, and unique (subject_id, name)
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(topics)").fetchall()]
+    has_last_rev = "last_reviewed" in cols
     conn.execute("""
     CREATE TABLE topics_new (
         id TEXT PRIMARY KEY,
@@ -134,11 +137,15 @@ def _migration_002_constraints_and_indexes(conn: sqlite3.Connection) -> None:
         name TEXT NOT NULL,
         mastery_level REAL DEFAULT 0.0 CHECK(mastery_level >= 0.0 AND mastery_level <= 1.0),
         notes TEXT,
+        last_reviewed TEXT,
         updated_at TEXT NOT NULL,
         FOREIGN KEY(subject_id) REFERENCES subjects(id) ON DELETE CASCADE
     );
     """)
-    conn.execute("INSERT INTO topics_new SELECT id, subject_id, name, mastery_level, notes, updated_at FROM topics;")
+    if has_last_rev:
+        conn.execute("INSERT INTO topics_new SELECT id, subject_id, name, mastery_level, notes, last_reviewed, updated_at FROM topics;")
+    else:
+        conn.execute("INSERT INTO topics_new SELECT id, subject_id, name, mastery_level, notes, NULL AS last_reviewed, updated_at FROM topics;")
     conn.execute("DROP TABLE topics;")
     conn.execute("ALTER TABLE topics_new RENAME TO topics;")
     conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_topics_subject_name_lower ON topics(subject_id, LOWER(name));")
@@ -1087,26 +1094,95 @@ class DatabaseManager:
 
     # --- QUIZZES & LEARNING PROGRESS ---
 
+    async def _has_topics_last_reviewed_column(self, conn: Any) -> bool:
+        cursor = await conn.execute("PRAGMA table_info(topics)")
+        rows = await cursor.fetchall()
+        cols = [r[1] for r in rows]
+        return "last_reviewed" in cols
+
     async def record_quiz_result(
         self,
-        result_id: str,
-        topic_id: Optional[str],
-        question: str,
-        student_answer: str,
-        correct_answer: str,
-        is_correct: bool,
-        score: float,
-        feedback: str,
-        subject_id: Optional[str] = None
+        *args: Any,
+        **kwargs: Any
     ) -> Dict[str, Any]:
-        cleaned_id = result_id.strip()
-        cleaned_q = question.strip()
-        if not cleaned_id:
-            raise ValueError("Quiz result ID cannot be empty.")
-        if not cleaned_q:
-            raise ValueError("Question cannot be empty.")
-        if not (0.0 <= score <= 1.0):
-            raise ValueError(f"Quiz score must be between 0.0 and 1.0, got {score}")
+        """Record a quiz evaluation result and update topic mastery via EMA.
+
+        Supports both standard signatures:
+        1. record_quiz_result(subject_id, topic_id, score, total_questions)
+        2. record_quiz_result(result_id, topic_id, question, student_answer, correct_answer, is_correct, score, feedback, [subject_id])
+        3. keyword arguments: record_quiz_result(subject_id=..., topic_id=..., score=..., ...)
+        """
+        import uuid as _uuid
+
+        resolved_id = None
+        resolved_subject_id = kwargs.get("subject_id")
+        resolved_topic_id = kwargs.get("topic_id")
+        resolved_q = kwargs.get("question")
+        resolved_student_ans = kwargs.get("student_answer")
+        resolved_correct_ans = kwargs.get("correct_answer")
+        resolved_is_correct = kwargs.get("is_correct")
+        resolved_score = kwargs.get("score")
+        resolved_feedback = kwargs.get("feedback")
+        resolved_total = kwargs.get("total_questions")
+
+        # Parse positional arguments
+        if len(args) == 4 and isinstance(args[2], (int, float)):
+            # Pattern: (subject_id, topic_id, score, total_questions)
+            resolved_subject_id = str(args[0]).strip() if args[0] else None
+            resolved_topic_id = str(args[1]).strip() if args[1] else None
+            resolved_score = float(args[2])
+            resolved_total = int(args[3])
+        elif len(args) >= 3 and isinstance(args[2], (int, float)):
+            # Pattern: (subject_id, topic_id, score)
+            resolved_subject_id = str(args[0]).strip() if args[0] else None
+            resolved_topic_id = str(args[1]).strip() if args[1] else None
+            resolved_score = float(args[2])
+            resolved_total = int(args[3]) if len(args) > 3 else 1
+        elif len(args) >= 7:
+            # Pattern: (result_id, topic_id, question, student_answer, correct_answer, is_correct, score, feedback, [subject_id])
+            resolved_id = str(args[0]).strip() if args[0] else None
+            resolved_topic_id = str(args[1]).strip() if args[1] else None
+            resolved_q = str(args[2]).strip()
+            resolved_student_ans = str(args[3])
+            resolved_correct_ans = str(args[4])
+            resolved_is_correct = bool(args[5])
+            resolved_score = float(args[6])
+            if len(args) > 7:
+                resolved_feedback = str(args[7])
+            if len(args) > 8:
+                resolved_subject_id = str(args[8]).strip() if args[8] else None
+        elif len(args) == 1:
+            resolved_id = str(args[0]).strip()
+
+        # Defaults for missing fields
+        if resolved_score is None:
+            resolved_score = 0.0
+        else:
+            resolved_score = float(resolved_score)
+
+        if not resolved_id:
+            resolved_id = str(kwargs.get("result_id") or _uuid.uuid4()).strip()
+
+        resolved_topic_id = str(resolved_topic_id).strip() if resolved_topic_id else None
+        resolved_total = int(resolved_total or 1)
+
+        if not resolved_q:
+            resolved_q = f"Quiz on topic {resolved_topic_id or 'general'} ({resolved_total} questions)"
+
+        if resolved_student_ans is None:
+            resolved_student_ans = f"{int(resolved_score * resolved_total)}/{resolved_total} correct"
+
+        if resolved_correct_ans is None:
+            resolved_correct_ans = f"{resolved_total}/{resolved_total} correct"
+
+        if resolved_is_correct is None:
+            resolved_is_correct = (resolved_score >= 0.7)
+
+        if not resolved_feedback:
+            resolved_feedback = f"Score: {round(resolved_score * 100, 1)}%"
+
+        if not (0.0 <= resolved_score <= 1.0):
+            raise ValueError(f"Quiz score must be between 0.0 and 1.0, got {resolved_score}")
 
         now = datetime.now(timezone.utc).isoformat()
         async with self.transaction() as conn:
@@ -1124,30 +1200,73 @@ class DatabaseManager:
                     subject_id = excluded.subject_id
                 """,
                 (
-                    cleaned_id, topic_id.strip() if topic_id else None, cleaned_q,
-                    student_answer, correct_answer, 1 if is_correct else 0, score, feedback, now,
-                    subject_id.strip() if subject_id else None
+                    resolved_id,
+                    resolved_topic_id if resolved_topic_id else None,
+                    resolved_q,
+                    resolved_student_ans,
+                    resolved_correct_ans,
+                    1 if resolved_is_correct else 0,
+                    resolved_score,
+                    resolved_feedback,
+                    now,
+                    resolved_subject_id
                 )
             )
-            # Update topic mastery level dynamically within the SAME atomic transaction
-            if topic_id:
-                cursor = await conn.execute(
-                    "SELECT AVG(score) as avg_score FROM quiz_results WHERE topic_id = ?",
-                    (topic_id.strip(),)
+
+            # Recalculate topic mastery level via Exponential Moving Average (EMA)
+            clamped_mastery = resolved_score
+            if resolved_topic_id:
+                cur = await conn.execute(
+                    "SELECT mastery_level FROM topics WHERE id = ?",
+                    (resolved_topic_id,)
                 )
-                row = await cursor.fetchone()
-                if row and row["avg_score"] is not None:
-                    await conn.execute(
-                        "UPDATE topics SET mastery_level = ?, updated_at = ? WHERE id = ?",
-                        (round(float(row["avg_score"]), 4), now, topic_id.strip())
+                topic_row = await cur.fetchone()
+                if topic_row:
+                    old_mastery = float(topic_row["mastery_level"] if topic_row["mastery_level"] is not None else 0.0)
+
+                    # Check prior quiz count
+                    cnt_cur = await conn.execute(
+                        "SELECT COUNT(*) as cnt FROM quiz_results WHERE topic_id = ?",
+                        (resolved_topic_id,)
                     )
+                    cnt_row = await cnt_cur.fetchone()
+                    total_quizzes = cnt_row["cnt"] if cnt_row else 1
+
+                    if total_quizzes <= 1 and old_mastery == 0.0:
+                        new_mastery = resolved_score
+                    else:
+                        # EMA: 70% prior mastery, 30% current quiz score
+                        new_mastery = (old_mastery * 0.7) + (resolved_score * 0.3)
+
+                    clamped_mastery = max(0.0, min(1.0, round(new_mastery, 4)))
+
+                    has_last_rev = await self._has_topics_last_reviewed_column(conn)
+                    if not has_last_rev:
+                        try:
+                            await conn.execute("ALTER TABLE topics ADD COLUMN last_reviewed TEXT;")
+                            has_last_rev = True
+                        except Exception:
+                            has_last_rev = False
+
+                    if has_last_rev:
+                        await conn.execute(
+                            "UPDATE topics SET mastery_level = ?, last_reviewed = ?, updated_at = ? WHERE id = ?",
+                            (clamped_mastery, now, now, resolved_topic_id)
+                        )
+                    else:
+                        await conn.execute(
+                            "UPDATE topics SET mastery_level = ?, updated_at = ? WHERE id = ?",
+                            (clamped_mastery, now, resolved_topic_id)
+                        )
+
             return {
-                "id": cleaned_id,
-                "topic_id": topic_id,
-                "question": cleaned_q,
-                "is_correct": is_correct,
-                "score": score,
-                "feedback": feedback,
+                "id": resolved_id,
+                "topic_id": resolved_topic_id,
+                "question": resolved_q,
+                "is_correct": resolved_is_correct,
+                "score": resolved_score,
+                "mastery_level": clamped_mastery,
+                "feedback": resolved_feedback,
                 "created_at": now
             }
 
@@ -1232,6 +1351,15 @@ class DatabaseManager:
             )
             return cursor.rowcount > 0
 
+    async def delete_task(self, task_id: str) -> bool:
+        """Delete an academic task by ID."""
+        cleaned_id = task_id.strip() if task_id else ""
+        if not cleaned_id:
+            raise ValueError("Task ID cannot be empty.")
+        async with self.transaction() as conn:
+            cursor = await conn.execute("DELETE FROM academic_tasks WHERE id = ?", (cleaned_id,))
+            return cursor.rowcount > 0
+
     async def list_tasks(self, status: Optional[str] = None) -> List[Dict[str, Any]]:
         async with self.get_connection() as conn:
             if status:
@@ -1239,6 +1367,56 @@ class DatabaseManager:
             else:
                 cursor = await conn.execute("SELECT * FROM academic_tasks ORDER BY deadline ASC")
             return [dict(r) for r in await cursor.fetchall()]
+
+    async def get_upcoming_tasks(
+        self,
+        subject_id: Optional[str] = None,
+        limit: int = 5,
+        days_ahead: int = 7
+    ) -> List[Dict[str, Any]]:
+        """Fetch pending academic tasks due within the next `days_ahead` days, sorted by closest deadline."""
+        from datetime import timedelta
+        safe_limit = max(1, limit)
+        now_dt = datetime.now(timezone.utc)
+        now_str = now_dt.isoformat()
+        future_str = (now_dt + timedelta(days=days_ahead)).isoformat()
+
+        async with self.get_connection() as conn:
+            query = """
+                SELECT * FROM academic_tasks
+                WHERE status != 'completed' AND status != 'cancelled'
+                  AND deadline IS NOT NULL
+                  AND deadline >= ?
+                  AND deadline <= ?
+            """
+            params: List[Any] = [now_str, future_str]
+            if subject_id:
+                query += " AND (subject_id = ? OR LOWER(subject_id) = LOWER(?))"
+                params.extend([subject_id.strip(), subject_id.strip()])
+
+            query += " ORDER BY deadline ASC LIMIT ?"
+            params.append(safe_limit)
+
+            cursor = await conn.execute(query, tuple(params))
+            rows = await cursor.fetchall()
+            return [dict(r) for r in rows]
+
+    async def get_overdue_tasks(self) -> List[Dict[str, Any]]:
+        """Fetch uncompleted academic tasks whose deadlines have passed."""
+        now_str = datetime.now(timezone.utc).isoformat()
+        async with self.get_connection() as conn:
+            cursor = await conn.execute(
+                """
+                SELECT * FROM academic_tasks
+                WHERE status != 'completed' AND status != 'cancelled'
+                  AND deadline IS NOT NULL
+                  AND deadline < ?
+                ORDER BY deadline ASC
+                """,
+                (now_str,)
+            )
+            rows = await cursor.fetchall()
+            return [dict(r) for r in rows]
 
     async def add_study_goal(
         self,
@@ -1299,6 +1477,56 @@ class DatabaseManager:
         async with self.get_connection() as conn:
             cursor = await conn.execute(query, params)
             return [dict(r) for r in await cursor.fetchall()]
+
+    async def update_goal_progress(self, goal_id: str, progress_percent: float) -> Dict[str, Any]:
+        """Update progress percentage of a study goal, clamping to [0, 100] and auto-completing at 100%."""
+        cleaned_id = goal_id.strip() if goal_id else ""
+        if not cleaned_id:
+            raise ValueError("Goal ID cannot be empty.")
+
+        clamped_percent = max(0.0, min(100.0, round(float(progress_percent), 2)))
+        now = datetime.now(timezone.utc).isoformat()
+
+        async with self.transaction() as conn:
+            cursor = await conn.execute(
+                """
+                UPDATE study_goals
+                SET progress_percent = ?,
+                    status = CASE WHEN ? = 100.0 THEN 'completed' ELSE status END
+                WHERE id = ?
+                """,
+                (clamped_percent, clamped_percent, cleaned_id)
+            )
+            if cursor.rowcount == 0:
+                raise ValueError(f"Study goal '{cleaned_id}' not found.")
+
+            c2 = await conn.execute("SELECT * FROM study_goals WHERE id = ?", (cleaned_id,))
+            row = await c2.fetchone()
+            return dict(row) if row else {}
+
+    async def get_active_goals(self, subject_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Retrieve active study goals (status = 'in_progress'), optionally filtered by subject."""
+        async with self.get_connection() as conn:
+            if subject_id:
+                cursor = await conn.execute(
+                    "SELECT * FROM study_goals WHERE status = 'in_progress' AND (subject_id = ? OR LOWER(subject_id) = LOWER(?)) ORDER BY created_at DESC",
+                    (subject_id.strip(), subject_id.strip())
+                )
+            else:
+                cursor = await conn.execute(
+                    "SELECT * FROM study_goals WHERE status = 'in_progress' ORDER BY created_at DESC"
+                )
+            rows = await cursor.fetchall()
+            return [dict(r) for r in rows]
+
+    async def delete_study_goal(self, goal_id: str) -> bool:
+        """Delete a study goal by ID."""
+        cleaned_id = goal_id.strip() if goal_id else ""
+        if not cleaned_id:
+            raise ValueError("Goal ID cannot be empty.")
+        async with self.transaction() as conn:
+            cursor = await conn.execute("DELETE FROM study_goals WHERE id = ?", (cleaned_id,))
+            return cursor.rowcount > 0
 
     # --- DOCUMENTS CATALOG ---
 

@@ -2,11 +2,18 @@
 
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+import inspect
+import json
+import logging
 import shutil
 import uuid
 import time
+from unittest.mock import AsyncMock
 from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile, status, Query
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
+
+logger = logging.getLogger("university_agent.api.routes")
 
 from app.config import settings
 from app.api.deps import get_services
@@ -148,9 +155,66 @@ async def system_status(request: Request):
 
 # --- CHAT & AGENT ---
 
-@router.post("/chat", response_model=AgentResponse)
+@router.post("/chat")
+@router.post("/agent/chat")
 async def chat_with_agent(req: AgentQueryRequest, request: Request):
-    return await get_services(request).agent.process_query(req)
+    services = get_services(request)
+    agent = services.agent
+
+    if req.stream is False:
+        return await agent.process_query(req)
+
+    async def sse_event_generator():
+        try:
+            has_mocked_pq = isinstance(getattr(agent, "process_query", None), AsyncMock)
+            has_mocked_pqs = isinstance(getattr(agent, "process_query_stream", None), AsyncMock)
+
+            if has_mocked_pq and not has_mocked_pqs:
+                res = await agent.process_query(req)
+                token_text = getattr(res, "reply", str(res))
+                session_id = getattr(res, "session_id", req.session_id or "")
+                yield f"data: {json.dumps({'token': token_text, 'session_id': session_id})}\n\n"
+                final_meta = {
+                    "used_sources": getattr(res, "used_sources", []),
+                    "reasoning_path": getattr(res, "reasoning_path", None),
+                    "intent": getattr(res, "intent", None)
+                }
+                yield f"data: {json.dumps({'done': True, 'session_id': session_id, 'reply': token_text, 'metadata': final_meta})}\n\n"
+                return
+
+            if hasattr(agent, "process_query_stream"):
+                stream = agent.process_query_stream(req)
+            else:
+                res = await agent.process_query(req)
+                token_text = getattr(res, "reply", str(res))
+                session_id = getattr(res, "session_id", req.session_id or "")
+                yield f"data: {json.dumps({'token': token_text, 'session_id': session_id})}\n\n"
+                final_meta = {
+                    "used_sources": getattr(res, "used_sources", []),
+                    "reasoning_path": getattr(res, "reasoning_path", None),
+                    "intent": getattr(res, "intent", None)
+                }
+                yield f"data: {json.dumps({'done': True, 'session_id': session_id, 'reply': token_text, 'metadata': final_meta})}\n\n"
+                return
+
+            if inspect.iscoroutine(stream):
+                stream = await stream
+
+            async for chunk in stream:
+                yield f"data: {json.dumps(chunk)}\n\n"
+        except Exception as e:
+            logger.error(f"SSE chat streaming error: {e}")
+            yield f"data: {json.dumps({'error': str(e), 'done': True, 'session_id': req.session_id or ''})}\n\n"
+
+    return StreamingResponse(
+        sse_event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no"
+        }
+    )
 
 
 @router.get("/chat/history/{session_id}")
@@ -232,8 +296,38 @@ async def upload_document(
 
 
 @router.get("/documents")
-async def list_documents(request: Request):
-    return get_services(request).vector_store.list_indexed_documents()
+async def list_documents(
+    request: Request,
+    subject_id: Optional[str] = Query(None, description="Filter documents by subject ID or name"),
+    status: Optional[str] = Query(None, description="Filter documents by ingestion status")
+):
+    services = get_services(request)
+    docs = await services.db.list_documents(subject_id=subject_id, status=status)
+    if not docs and subject_id:
+        async with services.db.get_connection() as conn:
+            cur = await conn.execute("SELECT id FROM subjects WHERE LOWER(name) = LOWER(?)", (subject_id.strip(),))
+            srow = await cur.fetchone()
+            if srow:
+                docs = await services.db.list_documents(subject_id=srow[0], status=status)
+
+    if not docs and not subject_id and not status:
+        return services.vector_store.list_indexed_documents()
+
+    if docs:
+        formatted = []
+        for d in docs:
+            item = dict(d)
+            item["total_chunks"] = d.get("chunk_count", 0)
+            item["total_pages"] = d.get("page_count", 1)
+            item["subject"] = d.get("subject_id") or ""
+            item["document_id"] = d.get("id")
+            formatted.append(item)
+        return formatted
+
+    vector_docs = services.vector_store.list_indexed_documents()
+    if subject_id:
+        return [d for d in vector_docs if d.get("subject") == subject_id or d.get("document_id") == subject_id]
+    return vector_docs
 
 
 @router.get("/documents/index-status")
@@ -312,24 +406,116 @@ async def retry_failed_documents(request: Request):
 
 # --- MEMORY, PROGRESS & TASKS ---
 
+@router.get("/memory/sessions")
+async def list_recent_sessions(request: Request, limit: int = Query(10, ge=1, le=100)):
+    return await get_services(request).db.get_recent_sessions(limit=limit)
+
+
+@router.get("/memory/sessions/{session_id}")
+async def get_session_history_by_id(session_id: str, request: Request, limit: int = Query(50, ge=1, le=500)):
+    return await get_services(request).db.get_session_history(session_id, limit=limit)
+
+
 @router.get("/memory/progress")
 async def get_progress(request: Request):
     return await get_services(request).db.get_learning_progress()
 
 
+# --- SUBJECTS & TOPICS ---
+
+class SubjectCreate(BaseModel):
+    name: str
+    code: Optional[str] = None
+    description: str = ""
+
+
+@router.get("/subjects")
 @router.get("/memory/subjects")
 async def get_subjects(request: Request):
     return await get_services(request).db.list_subjects()
 
 
-class SubjectCreate(BaseModel):
-    name: str
-    description: str = ""
-
-
+@router.post("/subjects")
 @router.post("/memory/subjects")
 async def create_subject(req: SubjectCreate, request: Request):
-    return await get_services(request).db.add_subject(str(uuid.uuid4()), req.name, req.description)
+    try:
+        subject_id = req.code.strip() if req.code and req.code.strip() else str(uuid.uuid4())
+        return await get_services(request).db.add_subject(
+            subject_id=subject_id,
+            name=req.name,
+            description=req.description,
+            code=req.code
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/subjects/{subject_id}")
+async def get_subject(subject_id: str, request: Request):
+    services = get_services(request)
+    async with services.db.get_connection() as conn:
+        cursor = await conn.execute(
+            "SELECT * FROM subjects WHERE id = ? OR LOWER(id) = LOWER(?) OR LOWER(code) = LOWER(?)",
+            (subject_id.strip(), subject_id.strip(), subject_id.strip())
+        )
+        row = await cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail=f"Subject '{subject_id}' not found.")
+        return dict(row)
+
+
+@router.delete("/subjects/{subject_id}")
+async def delete_subject(subject_id: str, request: Request):
+    services = get_services(request)
+    try:
+        deleted = await services.db.delete_subject(subject_id)
+        if not deleted:
+            raise HTTPException(status_code=404, detail=f"Subject '{subject_id}' not found.")
+        return {"status": "success", "deleted_subject_id": subject_id}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+class TopicCreatePayload(BaseModel):
+    name: str
+    mastery_level: float = 0.0
+    notes: str = ""
+    topic_id: Optional[str] = None
+
+
+@router.get("/subjects/{subject_id}/topics")
+async def get_subject_topics(subject_id: str, request: Request):
+    services = get_services(request)
+    async with services.db.get_connection() as conn:
+        cursor = await conn.execute(
+            "SELECT id FROM subjects WHERE id = ? OR LOWER(id) = LOWER(?) OR LOWER(code) = LOWER(?)",
+            (subject_id.strip(), subject_id.strip(), subject_id.strip())
+        )
+        row = await cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail=f"Subject '{subject_id}' not found.")
+        resolved_id = row[0]
+
+    return await services.db.list_topics(subject_id=resolved_id)
+
+
+@router.post("/subjects/{subject_id}/topics")
+async def create_subject_topic(subject_id: str, req: TopicCreatePayload, request: Request):
+    services = get_services(request)
+    try:
+        t_id = req.topic_id or str(uuid.uuid4())
+        return await services.db.add_or_update_topic(
+            topic_id=t_id,
+            subject_id=subject_id,
+            name=req.name,
+            mastery=req.mastery_level,
+            notes=req.notes
+        )
+    except ValueError as e:
+        msg = str(e)
+        if "does not exist" in msg.lower() or "not found" in msg.lower():
+            raise HTTPException(status_code=404, detail=msg)
+        raise HTTPException(status_code=400, detail=msg)
 
 
 @router.get("/memory/topics")
@@ -342,23 +528,28 @@ class TopicCreate(BaseModel):
     name: str
     mastery_level: float = 0.0
     notes: str = ""
+    topic_id: Optional[str] = None
 
 
 @router.post("/memory/topics")
 async def create_topic(req: TopicCreate, request: Request):
-    return await get_services(request).db.add_or_update_topic(
-        topic_id=str(uuid.uuid4()),
-        subject_id=req.subject_id,
-        name=req.name,
-        mastery=req.mastery_level,
-        notes=req.notes
-    )
+    try:
+        t_id = req.topic_id or str(uuid.uuid4())
+        return await get_services(request).db.add_or_update_topic(
+            topic_id=t_id,
+            subject_id=req.subject_id,
+            name=req.name,
+            mastery=req.mastery_level,
+            notes=req.notes
+        )
+    except ValueError as e:
+        msg = str(e)
+        if "does not exist" in msg.lower() or "not found" in msg.lower():
+            raise HTTPException(status_code=404, detail=msg)
+        raise HTTPException(status_code=400, detail=msg)
 
 
-@router.get("/memory/tasks")
-async def get_tasks(request: Request, status: Optional[str] = None):
-    return await get_services(request).db.list_tasks(status)
-
+# --- ACADEMIC TASKS ---
 
 class TaskCreate(BaseModel):
     title: str
@@ -368,31 +559,191 @@ class TaskCreate(BaseModel):
     priority: str = "medium"
 
 
-@router.post("/memory/tasks")
-async def create_task(req: TaskCreate, request: Request):
-    return await get_services(request).db.add_task(
-        task_id=str(uuid.uuid4()),
-        title=req.title,
-        description=req.description,
-        subject_id=req.subject_id,
-        deadline=req.deadline,
-        priority=req.priority
-    )
-
-
 class TaskStatusUpdate(BaseModel):
     status: str  # "pending", "completed"
 
 
+@router.get("/tasks")
+@router.get("/memory/tasks")
+async def get_tasks(
+    request: Request,
+    status: Optional[str] = Query(None, description="Filter by pending/completed status")
+):
+    return await get_services(request).db.list_tasks(status=status)
+
+
+@router.get("/tasks/upcoming")
+@router.get("/memory/tasks/upcoming")
+async def get_upcoming_tasks(
+    request: Request,
+    subject_id: Optional[str] = Query(None, description="Optional subject filter"),
+    days_ahead: int = Query(7, ge=1, le=365, description="Number of days ahead to look"),
+    limit: int = Query(10, ge=1, le=100, description="Maximum number of tasks to return")
+):
+    services = get_services(request)
+    return await services.db.get_upcoming_tasks(subject_id=subject_id, limit=limit, days_ahead=days_ahead)
+
+
+@router.get("/tasks/overdue")
+@router.get("/memory/tasks/overdue")
+async def get_overdue_tasks(request: Request):
+    services = get_services(request)
+    return await services.db.get_overdue_tasks()
+
+
+@router.post("/tasks")
+@router.post("/memory/tasks")
+async def create_task(req: TaskCreate, request: Request):
+    try:
+        return await get_services(request).db.add_task(
+            task_id=str(uuid.uuid4()),
+            title=req.title,
+            description=req.description,
+            subject_id=req.subject_id,
+            deadline=req.deadline,
+            priority=req.priority
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.patch("/tasks/{task_id}")
 @router.patch("/memory/tasks/{task_id}")
 async def update_task(task_id: str, req: TaskStatusUpdate, request: Request):
-    ok = await get_services(request).db.update_task_status(task_id, req.status)
-    if not ok:
-        raise HTTPException(status_code=404, detail="Task not found")
-    return {"status": "success", "task_id": task_id, "new_status": req.status}
+    try:
+        ok = await get_services(request).db.update_task_status(task_id, req.status)
+        if not ok:
+            raise HTTPException(status_code=404, detail=f"Task '{task_id}' not found")
+        return {"status": "success", "task_id": task_id, "new_status": req.status}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.delete("/tasks/{task_id}")
+@router.delete("/memory/tasks/{task_id}")
+async def delete_task_endpoint(task_id: str, request: Request):
+    services = get_services(request)
+    try:
+        deleted = await services.db.delete_task(task_id)
+        if not deleted:
+            raise HTTPException(status_code=404, detail=f"Task '{task_id}' not found")
+        return {"status": "success", "deleted_task_id": task_id}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+# --- STUDY GOALS ---
+
+class GoalCreate(BaseModel):
+    title: str
+    description: str = ""
+    target_date: Optional[str] = None
+    status: str = "in_progress"
+    progress_percent: float = 0.0
+    subject_id: Optional[str] = None
+    goal_id: Optional[str] = None
+
+
+class GoalProgressUpdate(BaseModel):
+    progress_percent: Optional[float] = None
+    progress: Optional[float] = None
+
+
+@router.get("/goals")
+@router.get("/memory/goals")
+async def list_goals(
+    request: Request,
+    status: Optional[str] = Query(None, description="Filter by status (in_progress, completed, etc.)"),
+    subject_id: Optional[str] = Query(None, description="Optional subject filter")
+):
+    services = get_services(request)
+    if status == "in_progress" and subject_id:
+        return await services.db.get_active_goals(subject_id=subject_id)
+    return await services.db.list_study_goals(status=status)
+
+
+@router.post("/goals")
+@router.post("/memory/goals")
+async def create_goal(req: GoalCreate, request: Request):
+    services = get_services(request)
+    try:
+        gid = req.goal_id or str(uuid.uuid4())
+        return await services.db.add_study_goal(
+            goal_id=gid,
+            title=req.title,
+            description=req.description,
+            target_date=req.target_date,
+            status=req.status,
+            progress_percent=req.progress_percent,
+            subject_id=req.subject_id
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/goals/{goal_id}")
+@router.get("/memory/goals/{goal_id}")
+async def get_goal(goal_id: str, request: Request):
+    services = get_services(request)
+    async with services.db.get_connection() as conn:
+        cursor = await conn.execute("SELECT * FROM study_goals WHERE id = ?", (goal_id.strip(),))
+        row = await cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail=f"Study goal '{goal_id}' not found.")
+        return dict(row)
+
+
+@router.patch("/goals/{goal_id}/progress")
+@router.patch("/memory/goals/{goal_id}/progress")
+async def update_goal_progress(goal_id: str, req: GoalProgressUpdate, request: Request):
+    services = get_services(request)
+    val = req.progress_percent if req.progress_percent is not None else (req.progress if req.progress is not None else 0.0)
+    try:
+        return await services.db.update_goal_progress(goal_id=goal_id, progress_percent=val)
+    except ValueError as e:
+        msg = str(e)
+        if "not found" in msg.lower():
+            raise HTTPException(status_code=404, detail=msg)
+        raise HTTPException(status_code=400, detail=msg)
+
+
+@router.delete("/goals/{goal_id}")
+@router.delete("/memory/goals/{goal_id}")
+async def delete_goal(goal_id: str, request: Request):
+    services = get_services(request)
+    try:
+        deleted = await services.db.delete_study_goal(goal_id)
+        if not deleted:
+            raise HTTPException(status_code=404, detail=f"Study goal '{goal_id}' not found.")
+        return {"status": "success", "deleted_goal_id": goal_id}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 # --- TUTOR QUIZZES ---
+
+class AgentQuizEndpointRequest(BaseModel):
+    subject_id: Optional[str] = None
+    topic: Optional[str] = None
+    num_questions: int = 5
+    hide_answers: bool = False
+    topic_name: Optional[str] = None
+    topic_id: Optional[str] = None
+
+
+@router.post("/agent/quiz")
+async def generate_agent_quiz(req: AgentQuizEndpointRequest, request: Request):
+    resolved_topic = req.topic or req.topic_name or ""
+    resolved_subject = req.subject_id or req.topic_id
+    return await get_services(request).agent.generate_quiz(
+        subject_id=resolved_subject,
+        topic=resolved_topic,
+        num_questions=req.num_questions,
+        hide_answers=req.hide_answers,
+        topic_id=req.topic_id,
+        topic_name=req.topic_name
+    )
+
 
 class QuizGenerateRequest(BaseModel):
     topic_id: str

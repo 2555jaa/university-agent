@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, Request, status
+from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
@@ -79,16 +80,18 @@ def create_app(custom_settings: Optional[Settings] = None) -> FastAPI:
     @app_instance.exception_handler(RequestValidationError)
     async def validation_exception_handler(request: Request, exc: RequestValidationError):
         req_id = getattr(request.state, "request_id", None) or request.headers.get("X-Request-ID") or str(uuid.uuid4())
-        logger.warning(f"Request validation error on {request.method} {request.url.path}: {exc.errors()}")
+        raw_errors = exc.errors()
+        encoded_errors = jsonable_encoder(raw_errors)
+        logger.warning(f"Request validation error on {request.method} {request.url.path}: {encoded_errors}")
         return JSONResponse(
             status_code=422,
             headers={"X-Request-ID": req_id},
             content={
-                "detail": exc.errors(),
+                "detail": encoded_errors,
                 "error": {
                     "code": "validation_error",
                     "message": "Request validation failed.",
-                    "details": exc.errors(),
+                    "details": encoded_errors,
                     "request_id": req_id
                 }
             }

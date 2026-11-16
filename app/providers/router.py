@@ -189,5 +189,41 @@ class ModelRouter:
                 return cloud_res
             raise
 
+    async def route_and_stream(
+        self,
+        messages: List[LLMMessage],
+        complexity: Optional[TaskComplexity] = None,
+        is_private: bool = True,
+        temperature: float = 0.7,
+        max_tokens: Optional[int] = 2048
+    ):
+        """Route request according to security policies and stream tokens."""
+        normalized_messages = self._normalize_messages(messages)
+        target_provider = await self.route_query(
+            messages=normalized_messages,
+            complexity=complexity,
+            is_private=is_private
+        )
+
+        if target_provider == "cloud" and hasattr(self.cloud_provider, "generate_stream"):
+            try:
+                async for chunk in self.cloud_provider.generate_stream(
+                    messages=normalized_messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens
+                ):
+                    yield chunk
+                return
+            except Exception as e:
+                logger.warning(f"Cloud stream failed ({e}), falling back to local Ollama.")
+
+        # Default to local stream
+        async for chunk in self.local_provider.generate_stream(
+            messages=normalized_messages,
+            temperature=temperature,
+            max_tokens=max_tokens
+        ):
+            yield chunk
+
 
 router = ModelRouter()
