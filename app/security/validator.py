@@ -2,7 +2,7 @@
 
 import os
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 import uuid
 import time
 import threading
@@ -63,19 +63,35 @@ class SecurityValidator:
         ".py", ".pyc", ".sh", ".bash", ".key", ".pem", ".db", ".log"
     }
 
-    def __init__(self, allowed_roots: Optional[List[Path]] = None):
-        if allowed_roots is None:
-            workspace_dir = (settings.BASE_DIR / "workspace").resolve()
-            workspace_dir.mkdir(parents=True, exist_ok=True)
-            documents_dir = settings.DOCUMENTS_DIR.resolve()
-            documents_dir.mkdir(parents=True, exist_ok=True)
-            self.allowed_roots = [documents_dir, workspace_dir]
+    def __init__(
+        self,
+        allowed_roots: Optional[List[Path]] = None,
+        settings_obj: Optional[Any] = None
+    ):
+        self.settings = settings_obj or settings
+        if allowed_roots is not None:
+            self._custom_roots = True
+            self._allowed_roots = [p.resolve() for p in allowed_roots]
         else:
-            self.allowed_roots = [p.resolve() for p in allowed_roots]
+            self._custom_roots = False
+            self._allowed_roots = []
 
         self._pending_approvals: Dict[str, ApprovalRequest] = {}
         # Approval state is shared by API worker threads; consumption must be atomic.
         self._approval_lock = threading.RLock()
+
+    @property
+    def allowed_roots(self) -> List[Path]:
+        if self._custom_roots:
+            return self._allowed_roots
+        workspace_dir = (self.settings.BASE_DIR / "workspace").resolve()
+        documents_dir = self.settings.DOCUMENTS_DIR.resolve()
+        return [documents_dir, workspace_dir]
+
+    @allowed_roots.setter
+    def allowed_roots(self, roots: List[Path]) -> None:
+        self._custom_roots = True
+        self._allowed_roots = [p.resolve() for p in roots]
 
     def is_sensitive_target(self, resolved_target: Path) -> bool:
         """Check if a path targets sensitive application configuration, secrets, or source code."""

@@ -43,12 +43,18 @@ class VectorStore:
 
     INDEX_VERSION = 2
 
-    def __init__(self, persist_dir: Optional[Path] = None):
-        self.persist_dir = persist_dir or settings.CHROMA_DIR
-        self.persist_dir.mkdir(parents=True, exist_ok=True)
+    def __init__(
+        self,
+        persist_dir: Optional[Path] = None,
+        settings_obj: Optional[Any] = None,
+        embedding_mgr: Optional[Any] = None
+    ):
+        self.settings = settings_obj or settings
+        self.persist_dir = persist_dir or self.settings.CHROMA_DIR
+        self.embedding_manager = embedding_mgr or embedding_manager
         self.chroma_client = None
         self.collection = None
-        self._init_chroma()
+        self._chroma_initialized = False
 
         # In-memory document & vector storage
         self._fallback_chunks: Dict[str, DocumentChunk] = {}
@@ -65,13 +71,17 @@ class VectorStore:
         }
 
         self._fallback_file = self.persist_dir / "fallback_index.json"
-        self._load_fallback_index()
+        if self._fallback_file.exists():
+            self._load_fallback_index()
 
     def _init_chroma(self) -> None:
         """Attempt to initialize ChromaDB PersistentClient if available."""
+        if self._chroma_initialized:
+            return
         try:
             import chromadb
             from chromadb.config import Settings as ChromaSettings
+            self.persist_dir.mkdir(parents=True, exist_ok=True)
             self.chroma_client = chromadb.PersistentClient(
                 path=str(self.persist_dir.resolve()),
                 settings=ChromaSettings(anonymized_telemetry=False)
@@ -83,6 +93,8 @@ class VectorStore:
             logger.info("ChromaDB initialized successfully.")
         except Exception as e:
             logger.info(f"ChromaDB not available in current environment ({e}); using embedded index.")
+        finally:
+            self._chroma_initialized = True
 
     def _backup_index(self) -> Optional[Path]:
         """Create a timestamped backup of the current index file."""
@@ -164,6 +176,7 @@ class VectorStore:
             }
 
             # Atomic write via temporary file
+            self.persist_dir.mkdir(parents=True, exist_ok=True)
             temp_file = self.persist_dir / f"fallback_index.tmp.{os.getpid()}"
             with open(temp_file, "w", encoding="utf-8") as f:
                 json.dump(payload, f)
@@ -176,7 +189,7 @@ class VectorStore:
 
     async def get_embedding(self, text: str, is_query: bool = False) -> List[float]:
         """Generate embedding vector using the active provider."""
-        provider = await embedding_manager.get_provider()
+        provider = await (self.embedding_manager or embedding_manager).get_provider()
         return await provider.get_embedding(text, is_query=is_query)
 
     async def ensure_index_compatibility(self) -> bool:
@@ -185,7 +198,7 @@ class VectorStore:
         If incompatible (e.g. switching from 256d hash to 768d nomic-embed-text),
         migrates by re-embedding all stored chunks.
         """
-        provider = await embedding_manager.get_provider()
+        provider = await (self.embedding_manager or embedding_manager).get_provider()
         info = provider.get_info()
 
         stored_dim = self._index_metadata.get("embedding_dimension", 0)
@@ -214,7 +227,7 @@ class VectorStore:
     async def migrate_index(self, target_provider: Optional[BaseEmbeddingProvider] = None) -> bool:
         """Safely re-embed all indexed chunks using the target embedding provider."""
         if target_provider is None:
-            target_provider = await embedding_manager.get_provider()
+            target_provider = await (self.embedding_manager or embedding_manager).get_provider()
 
         info = target_provider.get_info()
         logger.info(f"Starting index migration to provider '{info.provider}' (model: '{info.model}', dim: {info.dimension})...")
@@ -280,7 +293,7 @@ class VectorStore:
         # Ensure index compatibility before adding
         await self.ensure_index_compatibility()
 
-        provider = await embedding_manager.get_provider()
+        provider = await (self.embedding_manager or embedding_manager).get_provider()
         info = provider.get_info()
 
         # Update metadata to reflect current provider
@@ -375,7 +388,7 @@ class VectorStore:
         # Ensure vector compatibility
         await self.ensure_index_compatibility()
 
-        provider = await embedding_manager.get_provider()
+        provider = await (self.embedding_manager or embedding_manager).get_provider()
         is_neural = self._index_metadata.get("is_neural", False)
 
         default_thresh = getattr(settings, "RAG_SIMILARITY_THRESHOLD", 0.45)

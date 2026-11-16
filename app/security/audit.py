@@ -24,9 +24,9 @@ class AuditEntry(BaseModel):
 class AuditLogger:
     """Manages append-only JSON line audit logs for forensic security and academic accountability."""
 
-    def __init__(self, log_path: Optional[Path] = None):
-        self.log_path = log_path or settings.AUDIT_LOG_PATH
-        self.log_path.parent.mkdir(parents=True, exist_ok=True)
+    def __init__(self, log_path: Optional[Path] = None, settings_obj: Optional[Any] = None):
+        self.settings = settings_obj or settings
+        self.log_path = log_path or self.settings.AUDIT_LOG_PATH
         self.logger = logging.getLogger("university_agent.audit")
         self.logger.setLevel(logging.INFO)
 
@@ -51,6 +51,7 @@ class AuditLogger:
             error=error
         )
         try:
+            self.log_path.parent.mkdir(parents=True, exist_ok=True)
             with open(self.log_path, "a", encoding="utf-8") as f:
                 f.write(entry.model_dump_json() + "\n")
         except Exception as e:

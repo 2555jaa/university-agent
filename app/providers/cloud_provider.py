@@ -17,16 +17,18 @@ class CloudAIProvider(BaseLLMProvider):
         self,
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,
-        model: Optional[str] = None
+        model: Optional[str] = None,
+        settings_obj: Optional[Any] = None
     ):
-        self.api_key = api_key or settings.CLOUD_API_KEY
-        self.base_url = (base_url or settings.CLOUD_BASE_URL).rstrip("/")
-        self.model = model or settings.CLOUD_MODEL
+        self.settings = settings_obj or settings
+        self.api_key = api_key or self.settings.CLOUD_API_KEY
+        self.base_url = (base_url or self.settings.CLOUD_BASE_URL).rstrip("/")
+        self.model = model or self.settings.CLOUD_MODEL
         self.timeout = 60.0
 
     async def is_available(self) -> bool:
         """Check if cloud provider is enabled and key is present."""
-        if not settings.CLOUD_ENABLED or not self.api_key:
+        if not self.settings.CLOUD_ENABLED or not self.api_key:
             return False
         return True
 

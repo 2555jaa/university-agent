@@ -59,10 +59,12 @@ class OllamaEmbeddingProvider(BaseEmbeddingProvider):
         self,
         base_url: Optional[str] = None,
         model: Optional[str] = None,
-        dimension: int = 768
+        dimension: int = 768,
+        settings_obj: Optional[Any] = None
     ):
-        self.base_url = (base_url or settings.OLLAMA_BASE_URL).rstrip("/")
-        self.model = model or settings.EMBEDDING_MODEL
+        self.settings = settings_obj or settings
+        self.base_url = (base_url or self.settings.OLLAMA_BASE_URL).rstrip("/")
+        self.model = model or self.settings.EMBEDDING_MODEL
         self.dimension = dimension
         self.timeout = 20.0
         self._available_cache: Optional[bool] = None
@@ -189,9 +191,15 @@ class DeterministicHashEmbeddingProvider(BaseEmbeddingProvider):
 class EmbeddingManager:
     """Manages active embedding provider selection and model switching."""
 
-    def __init__(self):
-        self.ollama_provider = OllamaEmbeddingProvider()
-        self.hash_provider = DeterministicHashEmbeddingProvider()
+    def __init__(
+        self,
+        settings_obj: Optional[Any] = None,
+        ollama_provider: Optional[BaseEmbeddingProvider] = None,
+        hash_provider: Optional[BaseEmbeddingProvider] = None
+    ):
+        self.settings = settings_obj or settings
+        self.ollama_provider = ollama_provider or OllamaEmbeddingProvider(settings_obj=self.settings)
+        self.hash_provider = hash_provider or DeterministicHashEmbeddingProvider()
         self._active_provider: Optional[BaseEmbeddingProvider] = None
 
     async def get_provider(self, force_refresh: bool = False) -> BaseEmbeddingProvider:
@@ -200,7 +208,7 @@ class EmbeddingManager:
             return self._active_provider
 
         # Check configured preference
-        pref = getattr(settings, "EMBEDDING_PROVIDER", "auto").lower()
+        pref = getattr(self.settings, "EMBEDDING_PROVIDER", "auto").lower()
 
         if pref == "deterministic_hash":
             logger.info("Using configured DeterministicHashEmbeddingProvider (non-neural).")

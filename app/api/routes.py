@@ -5,10 +5,11 @@ from typing import Any, Dict, List, Optional
 import shutil
 import uuid
 import time
-from fastapi import APIRouter, File, Form, HTTPException, UploadFile, status
+from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile, status
 from pydantic import BaseModel, Field
 
 from app.config import settings
+from app.api.deps import get_services
 from app.agent.orchestrator import academic_agent, AgentQueryRequest, AgentResponse
 from app.knowledge.rag_service import rag_service, IngestionResult
 from app.knowledge.vector_store import vector_store
@@ -28,17 +29,19 @@ router = APIRouter()
 # --- HEALTH & STATUS ---
 
 @router.get("/health")
-async def health_check():
-    ollama_ok = await OllamaProvider().is_available()
-    cloud_ok = await CloudAIProvider().is_available()
-    emb_info = await embedding_manager.get_active_info()
+async def health_check(request: Request):
+    services = get_services(request)
+    s = services.settings
+    ollama_ok = await OllamaProvider(settings_obj=s).is_available()
+    cloud_ok = await CloudAIProvider(settings_obj=s).is_available()
+    emb_info = await services.embedding_manager.get_active_info()
     return {
         "status": "healthy",
-        "app_name": settings.APP_NAME,
-        "version": settings.APP_VERSION,
+        "app_name": s.APP_NAME,
+        "version": s.APP_VERSION,
         "ollama_available": ollama_ok,
         "cloud_available": cloud_ok,
-        "local_model": settings.LOCAL_MODEL,
+        "local_model": s.LOCAL_MODEL,
         "embedding_provider": emb_info.provider,
         "embedding_model": emb_info.model,
         "embedding_is_neural": emb_info.is_neural,
@@ -47,7 +50,9 @@ async def health_check():
 
 
 @router.get("/system/status")
-async def system_status():
+async def system_status(request: Request):
+    services = get_services(request)
+    s = services.settings
     mem_info = {}
     try:
         with open("/proc/meminfo", "r") as f:
@@ -61,32 +66,32 @@ async def system_status():
     except Exception:
         pass
 
-    ollama_provider = OllamaProvider()
+    ollama_provider = OllamaProvider(settings_obj=s)
     loaded_models = await ollama_provider.get_loaded_models()
-    emb_info = await embedding_manager.get_active_info()
+    emb_info = await services.embedding_manager.get_active_info()
 
     return {
         "memory": mem_info,
-        "ollama_base_url": settings.OLLAMA_BASE_URL,
+        "ollama_base_url": s.OLLAMA_BASE_URL,
         "ollama_connected": await ollama_provider.is_available(),
         "available_local_models": loaded_models,
-        "active_local_model": settings.LOCAL_MODEL,
-        "cloud_routing_enabled": settings.CLOUD_ENABLED,
+        "active_local_model": s.LOCAL_MODEL,
+        "cloud_routing_enabled": s.CLOUD_ENABLED,
         "embedding": emb_info.model_dump(),
-        "vector_index": vector_store.get_index_status()
+        "vector_index": services.vector_store.get_index_status()
     }
 
 
 # --- CHAT & AGENT ---
 
 @router.post("/chat", response_model=AgentResponse)
-async def chat_with_agent(req: AgentQueryRequest):
-    return await academic_agent.process_query(req)
+async def chat_with_agent(req: AgentQueryRequest, request: Request):
+    return await get_services(request).agent.process_query(req)
 
 
 @router.get("/chat/history/{session_id}")
-async def get_chat_history(session_id: str):
-    return await db.get_session_history(session_id)
+async def get_chat_history(session_id: str, request: Request):
+    return await get_services(request).db.get_session_history(session_id)
 
 
 # --- DOCUMENT INGESTION & RAG ---
@@ -95,9 +100,16 @@ ALLOWED_DOCUMENT_EXTENSIONS = {".pdf", ".docx", ".doc", ".txt", ".md"}
 
 @router.post("/documents/upload", response_model=IngestionResult)
 async def upload_document(
+    request: Request,
     file: UploadFile = File(...),
     subject: Optional[str] = Form(None)
 ):
+    services = get_services(request)
+    s = services.settings
+    validator = services.security_validator
+    rag = services.rag_service
+    database = services.db
+
     raw_name = (file.filename or "").strip()
     if not raw_name or raw_name in (".", ".."):
         raise HTTPException(status_code=400, detail="Invalid filename provided.")
@@ -110,14 +122,15 @@ async def upload_document(
             detail=f"Unsupported file format '{ext}'. Allowed formats: {sorted(list(ALLOWED_DOCUMENT_EXTENSIONS))}"
         )
 
-    dest_path = settings.DOCUMENTS_DIR / safe_name
-    if security_validator.is_sensitive_target(dest_path):
+    dest_path = s.DOCUMENTS_DIR / safe_name
+    if validator.is_sensitive_target(dest_path):
         raise HTTPException(status_code=403, detail="Filename targets restricted configuration/system name.")
 
     # Save to disk with strict streaming size limiter
-    max_bytes = settings.MAX_UPLOAD_SIZE_MB * 1024 * 1024
+    max_bytes = s.MAX_UPLOAD_SIZE_MB * 1024 * 1024
     total_bytes = 0
     try:
+        dest_path.parent.mkdir(parents=True, exist_ok=True)
         with open(dest_path, "wb") as buffer:
             while chunk := await file.read(64 * 1024):
                 total_bytes += len(chunk)
@@ -127,7 +140,7 @@ async def upload_document(
                         dest_path.unlink()
                     raise HTTPException(
                         status_code=413,
-                        detail=f"File exceeds maximum allowed upload size of {settings.MAX_UPLOAD_SIZE_MB}MB."
+                        detail=f"File exceeds maximum allowed upload size of {s.MAX_UPLOAD_SIZE_MB}MB."
                     )
                 buffer.write(chunk)
     except HTTPException:
@@ -143,10 +156,10 @@ async def upload_document(
         raise HTTPException(status_code=400, detail="Uploaded file is empty (0 bytes).")
 
     try:
-        result = await rag_service.ingest_document(dest_path, subject=subject)
+        result = await rag.ingest_document(dest_path, subject=subject)
         if subject:
             # Register subject in SQLite if new
-            await db.add_subject(subject_id=str(uuid.uuid4()), name=subject)
+            await database.add_subject(subject_id=str(uuid.uuid4()), name=subject)
         return result
     except Exception as e:
         if dest_path.exists():
@@ -155,13 +168,13 @@ async def upload_document(
 
 
 @router.get("/documents")
-async def list_documents():
-    return vector_store.list_indexed_documents()
+async def list_documents(request: Request):
+    return get_services(request).vector_store.list_indexed_documents()
 
 
 @router.get("/documents/index-status")
-async def get_index_status():
-    return vector_store.get_index_status()
+async def get_index_status(request: Request):
+    return get_services(request).vector_store.get_index_status()
 
 
 class ReindexRequest(BaseModel):
@@ -169,8 +182,8 @@ class ReindexRequest(BaseModel):
 
 
 @router.post("/documents/reindex")
-async def reindex_documents(req: ReindexRequest = ReindexRequest()):
-    return await rag_service.reindex_all_documents(force=req.force)
+async def reindex_documents(request: Request, req: ReindexRequest = ReindexRequest()):
+    return await get_services(request).rag_service.reindex_all_documents(force=req.force)
 
 
 class SearchQuery(BaseModel):
@@ -180,8 +193,8 @@ class SearchQuery(BaseModel):
 
 
 @router.post("/documents/search")
-async def search_documents(req: SearchQuery):
-    results = await vector_store.search(query=req.query, top_k=req.top_k, subject=req.subject)
+async def search_documents(req: SearchQuery, request: Request):
+    results = await get_services(request).vector_store.search(query=req.query, top_k=req.top_k, subject=req.subject)
     return [
         {
             "chunk_id": r.chunk_id,
@@ -202,13 +215,13 @@ async def search_documents(req: SearchQuery):
 # --- MEMORY, PROGRESS & TASKS ---
 
 @router.get("/memory/progress")
-async def get_progress():
-    return await db.get_learning_progress()
+async def get_progress(request: Request):
+    return await get_services(request).db.get_learning_progress()
 
 
 @router.get("/memory/subjects")
-async def get_subjects():
-    return await db.list_subjects()
+async def get_subjects(request: Request):
+    return await get_services(request).db.list_subjects()
 
 
 class SubjectCreate(BaseModel):
@@ -217,13 +230,13 @@ class SubjectCreate(BaseModel):
 
 
 @router.post("/memory/subjects")
-async def create_subject(req: SubjectCreate):
-    return await db.add_subject(str(uuid.uuid4()), req.name, req.description)
+async def create_subject(req: SubjectCreate, request: Request):
+    return await get_services(request).db.add_subject(str(uuid.uuid4()), req.name, req.description)
 
 
 @router.get("/memory/topics")
-async def get_topics(subject_id: Optional[str] = None):
-    return await db.list_topics(subject_id)
+async def get_topics(request: Request, subject_id: Optional[str] = None):
+    return await get_services(request).db.list_topics(subject_id)
 
 
 class TopicCreate(BaseModel):
@@ -234,8 +247,8 @@ class TopicCreate(BaseModel):
 
 
 @router.post("/memory/topics")
-async def create_topic(req: TopicCreate):
-    return await db.add_or_update_topic(
+async def create_topic(req: TopicCreate, request: Request):
+    return await get_services(request).db.add_or_update_topic(
         topic_id=str(uuid.uuid4()),
         subject_id=req.subject_id,
         name=req.name,
@@ -245,8 +258,8 @@ async def create_topic(req: TopicCreate):
 
 
 @router.get("/memory/tasks")
-async def get_tasks(status: Optional[str] = None):
-    return await db.list_tasks(status)
+async def get_tasks(request: Request, status: Optional[str] = None):
+    return await get_services(request).db.list_tasks(status)
 
 
 class TaskCreate(BaseModel):
@@ -258,8 +271,8 @@ class TaskCreate(BaseModel):
 
 
 @router.post("/memory/tasks")
-async def create_task(req: TaskCreate):
-    return await db.add_task(
+async def create_task(req: TaskCreate, request: Request):
+    return await get_services(request).db.add_task(
         task_id=str(uuid.uuid4()),
         title=req.title,
         description=req.description,
@@ -274,8 +287,8 @@ class TaskStatusUpdate(BaseModel):
 
 
 @router.patch("/memory/tasks/{task_id}")
-async def update_task(task_id: str, req: TaskStatusUpdate):
-    ok = await db.update_task_status(task_id, req.status)
+async def update_task(task_id: str, req: TaskStatusUpdate, request: Request):
+    ok = await get_services(request).db.update_task_status(task_id, req.status)
     if not ok:
         raise HTTPException(status_code=404, detail="Task not found")
     return {"status": "success", "task_id": task_id, "new_status": req.status}
@@ -290,8 +303,8 @@ class QuizGenerateRequest(BaseModel):
 
 
 @router.post("/tutor/quiz/generate")
-async def generate_quiz_endpoint(req: QuizGenerateRequest):
-    return await academic_agent.generate_quiz(
+async def generate_quiz_endpoint(req: QuizGenerateRequest, request: Request):
+    return await get_services(request).agent.generate_quiz(
         topic_id=req.topic_id,
         topic_name=req.topic_name,
         num_questions=req.num_questions
@@ -306,8 +319,8 @@ class QuizEvaluateRequest(BaseModel):
 
 
 @router.post("/tutor/quiz/evaluate")
-async def evaluate_quiz_endpoint(req: QuizEvaluateRequest):
-    return await academic_agent.evaluate_quiz_answer(
+async def evaluate_quiz_endpoint(req: QuizEvaluateRequest, request: Request):
+    return await get_services(request).agent.evaluate_quiz_answer(
         topic_id=req.topic_id,
         question=req.question,
         student_answer=req.student_answer,
@@ -391,8 +404,8 @@ async def privileged_terminal_endpoint(req: TerminalRunRequest):
 # --- APPROVAL MANAGEMENT ---
 
 @router.get("/security/approvals")
-async def list_pending_approvals():
-    return security_validator.list_pending()
+async def list_pending_approvals(request: Request):
+    return get_services(request).security_validator.list_pending()
 
 
 class ApprovalDecision(BaseModel):
@@ -400,11 +413,12 @@ class ApprovalDecision(BaseModel):
 
 
 @router.post("/security/approvals/{approval_id}/approve")
-async def approve_request(approval_id: str, req: ApprovalDecision = ApprovalDecision()):
-    ok = security_validator.approve_action(approval_id, req.reason)
+async def approve_request(approval_id: str, request: Request, req: ApprovalDecision = ApprovalDecision()):
+    services = get_services(request)
+    ok = services.security_validator.approve_action(approval_id, req.reason)
     if not ok:
         raise HTTPException(status_code=404, detail="Request not found or not in pending state")
-    audit_logger.log_event(
+    services.audit_logger.log_event(
         event_type="security_approval",
         action="action_approved",
         details={"approval_id": approval_id, "note": req.reason},
@@ -416,11 +430,12 @@ async def approve_request(approval_id: str, req: ApprovalDecision = ApprovalDeci
 
 
 @router.post("/security/approvals/{approval_id}/reject")
-async def reject_request(approval_id: str, req: ApprovalDecision = ApprovalDecision()):
-    ok = security_validator.reject_action(approval_id, req.reason)
+async def reject_request(approval_id: str, request: Request, req: ApprovalDecision = ApprovalDecision()):
+    services = get_services(request)
+    ok = services.security_validator.reject_action(approval_id, req.reason)
     if not ok:
         raise HTTPException(status_code=404, detail="Request not found or not in pending state")
-    audit_logger.log_event(
+    services.audit_logger.log_event(
         event_type="security_approval",
         action="action_rejected",
         details={"approval_id": approval_id, "note": req.reason},
@@ -432,8 +447,8 @@ async def reject_request(approval_id: str, req: ApprovalDecision = ApprovalDecis
 
 
 @router.get("/security/audit")
-async def get_audit_log(limit: int = 50):
-    return audit_logger.read_recent_events(limit=limit)
+async def get_audit_log(request: Request, limit: int = 50):
+    return get_services(request).audit_logger.read_recent_events(limit=limit)
 
 
 # --- OPEN WEBUI / OPENAI COMPATIBILITY ---
@@ -475,7 +490,7 @@ class OpenAIChatCompletionRequest(BaseModel):
 
 
 @router.post("/v1/chat/completions")
-async def openai_chat_completions(req: OpenAIChatCompletionRequest):
+async def openai_chat_completions(req: OpenAIChatCompletionRequest, request: Request):
     """OpenAI-compatible chat completion endpoint connecting Open WebUI to our agent."""
     user_prompt = ""
     for m in reversed(req.messages):
@@ -493,7 +508,7 @@ async def openai_chat_completions(req: OpenAIChatCompletionRequest):
         use_rag=True,
         is_private=True
     )
-    res = await academic_agent.process_query(agent_req)
+    res = await get_services(request).agent.process_query(agent_req)
 
     return {
         "id": f"chatcmpl-{res.message_id}",

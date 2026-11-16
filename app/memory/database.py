@@ -98,12 +98,14 @@ CREATE INDEX IF NOT EXISTS idx_topics_subject ON topics(subject_id);
 class DatabaseManager:
     """Async & sync manager for SQLite persistent memory."""
 
-    def __init__(self, db_path: Optional[Path] = None):
-        self.db_path = db_path or settings.SQLITE_PATH
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self.init_db_sync()
+    def __init__(self, db_path: Optional[Path] = None, settings_obj: Optional[Any] = None):
+        self.settings = settings_obj or settings
+        self.db_path = db_path or self.settings.SQLITE_PATH
+        self._initialized = False
 
     def get_connection_sync(self) -> sqlite3.Connection:
+        if not self._initialized and self.db_path.parent.exists():
+            pass
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON;")
@@ -111,13 +113,21 @@ class DatabaseManager:
 
     def init_db_sync(self) -> None:
         """Initialize database tables synchronously on startup."""
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
         with self.get_connection_sync() as conn:
             conn.executescript(SCHEMA_SQL)
             conn.commit()
+        self._initialized = True
+
+    async def init_db(self) -> None:
+        """Initialize database tables asynchronously."""
+        self.init_db_sync()
 
     @asynccontextmanager
     async def get_connection(self):
         """Async context manager yielding an aiosqlite connection with row factory and foreign keys."""
+        if not self._initialized:
+            self.init_db_sync()
         async with aiosqlite.connect(self.db_path) as conn:
             conn.row_factory = aiosqlite.Row
             await conn.execute("PRAGMA foreign_keys = ON;")

@@ -2,7 +2,7 @@
 
 import logging
 from enum import Enum
-from typing import List, Optional
+from typing import Any, List, Optional
 
 from app.config import settings
 from app.providers.base import BaseLLMProvider, LLMMessage, LLMResponse
@@ -24,10 +24,12 @@ class ModelRouter:
     def __init__(
         self,
         local_provider: Optional[BaseLLMProvider] = None,
-        cloud_provider: Optional[BaseLLMProvider] = None
+        cloud_provider: Optional[BaseLLMProvider] = None,
+        settings_obj: Optional[Any] = None
     ):
-        self.local_provider = local_provider or OllamaProvider()
-        self.cloud_provider = cloud_provider or CloudAIProvider()
+        self.settings = settings_obj or settings
+        self.local_provider = local_provider or OllamaProvider(settings_obj=self.settings)
+        self.cloud_provider = cloud_provider or CloudAIProvider(settings_obj=self.settings)
 
     async def route_and_generate(
         self,

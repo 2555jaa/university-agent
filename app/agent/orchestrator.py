@@ -7,6 +7,7 @@ import logging
 from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field
 
+from app.config import settings
 from app.agent.prompts import (
     TUTOR_SYSTEM_PROMPT,
     RESEARCH_SYSTEM_PROMPT,
@@ -49,10 +50,19 @@ class AgentResponse(BaseModel):
 class AcademicAgent:
     """Core University AI Agent orchestrating learning, research, memory, and tools."""
 
-    def __init__(self):
-        self.router = router
-        self.rag = rag_service
-        self.db = db
+    def __init__(
+        self,
+        router_instance: Optional[Any] = None,
+        rag_instance: Optional[Any] = None,
+        db_instance: Optional[Any] = None,
+        audit: Optional[Any] = None,
+        settings_obj: Optional[Any] = None
+    ):
+        self.settings = settings_obj or settings
+        self.router = router_instance or router
+        self.rag = rag_instance or rag_service
+        self.db = db_instance or db
+        self.audit = audit or audit_logger
         self._inference_semaphore = asyncio.Semaphore(2)
 
     def _get_system_prompt(self, mode: str) -> str:
@@ -162,7 +172,7 @@ class AcademicAgent:
             citations=grounded_ctx.citations
         )
 
-        audit_logger.log_event(
+        self.audit.log_event(
             event_type="agent_interaction",
             action="process_query",
             details={

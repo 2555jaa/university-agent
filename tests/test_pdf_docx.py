@@ -49,7 +49,7 @@ def test_real_docx_generation_and_parsing(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_pdf_end_to_end_rag_ingestion(tmp_path):
+async def test_pdf_end_to_end_rag_ingestion(tmp_path, test_container):
     """End-to-end ingestion of a PDF into the RAG knowledge system with citation retrieval."""
     pdf_path = tmp_path / "operating_systems.pdf"
     doc = fitz.open()
@@ -58,13 +58,13 @@ async def test_pdf_end_to_end_rag_ingestion(tmp_path):
     doc.save(str(pdf_path))
     doc.close()
 
-    result = await rag_service.ingest_document(pdf_path, subject="Computer Science")
+    result = await test_container.rag_service.ingest_document(pdf_path, subject="Computer Science")
     assert result.status == "success"
     assert result.total_pages == 1
     assert result.total_chunks >= 1
 
     # Query RAG
-    context = await rag_service.retrieve_grounded_context("What does paging do in virtual memory?", subject="Computer Science")
+    context = await test_container.rag_service.retrieve_grounded_context("What does paging do in virtual memory?", subject="Computer Science")
     assert context.has_relevant_info is True
     assert len(context.citations) >= 1
     assert context.citations[0]["filename"] == "operating_systems.pdf"

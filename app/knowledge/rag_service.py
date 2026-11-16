@@ -36,10 +36,19 @@ class GroundedContext(BaseModel):
 class RAGService:
     """Manages document ingestion, citation-grounded retrieval, and query formatting."""
 
-    def __init__(self):
-        self.parser = document_parser
-        self.chunker = academic_chunker
-        self.store = vector_store
+    def __init__(
+        self,
+        parser: Optional[Any] = None,
+        chunker: Optional[Any] = None,
+        store: Optional[Any] = None,
+        audit: Optional[Any] = None,
+        settings_obj: Optional[Any] = None
+    ):
+        self.settings = settings_obj or settings
+        self.parser = parser or document_parser
+        self.chunker = chunker or academic_chunker
+        self.store = store or vector_store
+        self.audit = audit or audit_logger
         self._ingest_lock = asyncio.Semaphore(1)
 
     async def ingest_document(self, file_path: Path, subject: Optional[str] = None) -> IngestionResult:
@@ -50,7 +59,7 @@ class RAGService:
             chunks = self.chunker.chunk_document(parsed)
             indexed_count = await self.store.add_chunks(chunks, file_sha256=parsed.sha256)
 
-        audit_logger.log_event(
+        self.audit.log_event(
             event_type="document_ingestion",
             action="ingest_file",
             details={

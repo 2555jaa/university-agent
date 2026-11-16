@@ -13,9 +13,15 @@ logger = logging.getLogger("university_agent.providers.ollama")
 class OllamaProvider(BaseLLMProvider):
     """Local inference provider via Ollama HTTP API."""
 
-    def __init__(self, base_url: Optional[str] = None, model: Optional[str] = None):
-        self.base_url = (base_url or settings.OLLAMA_BASE_URL).rstrip("/")
-        self.model = model or settings.LOCAL_MODEL
+    def __init__(
+        self,
+        base_url: Optional[str] = None,
+        model: Optional[str] = None,
+        settings_obj: Optional[Any] = None
+    ):
+        self.settings = settings_obj or settings
+        self.base_url = (base_url or self.settings.OLLAMA_BASE_URL).rstrip("/")
+        self.model = model or self.settings.LOCAL_MODEL
         self.timeout = 120.0
 
     async def is_available(self) -> bool:
