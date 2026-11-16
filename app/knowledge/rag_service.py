@@ -1,16 +1,19 @@
-"""RAG service orchestrating document ingestion, retrieval, heading-aware citation generation, and idempotent reindexing."""
+"""RAG service orchestrating document ingestion, retrieval, catalog synchronization, safe deletion, and failure recovery."""
 
 import asyncio
+import hashlib
 import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+import uuid
 from pydantic import BaseModel, Field
 
 from app.config import settings
-from app.knowledge.document_parser import document_parser
+from app.knowledge.document_parser import document_parser, DocumentParseError
 from app.knowledge.chunker import academic_chunker
 from app.knowledge.vector_store import vector_store, SearchResult
 from app.security.audit import audit_logger
+from app.memory.database import db as default_db
 
 logger = logging.getLogger("university_agent.knowledge.rag")
 
@@ -25,6 +28,10 @@ class IngestionResult(BaseModel):
     total_characters: int
     sha256: str = ""
     status: str = "success"
+    is_duplicate: bool = False
+    error_message: Optional[str] = None
+    doc_category: Optional[str] = None
+    course_code: Optional[str] = None
 
 
 class GroundedContext(BaseModel):
@@ -34,7 +41,7 @@ class GroundedContext(BaseModel):
 
 
 class RAGService:
-    """Manages document ingestion, citation-grounded retrieval, and query formatting."""
+    """Manages document ingestion, citation-grounded retrieval, catalog sync, deletion, and failure recovery."""
 
     def __init__(
         self,
@@ -42,6 +49,7 @@ class RAGService:
         chunker: Optional[Any] = None,
         store: Optional[Any] = None,
         audit: Optional[Any] = None,
+        db: Optional[Any] = None,
         settings_obj: Optional[Any] = None
     ):
         self.settings = settings_obj or settings
@@ -49,41 +57,302 @@ class RAGService:
         self.chunker = chunker or academic_chunker
         self.store = store or vector_store
         self.audit = audit or audit_logger
+        self.db = db if db is not None else default_db
         self._ingest_lock = asyncio.Semaphore(1)
 
-    async def ingest_document(self, file_path: Path, subject: Optional[str] = None) -> IngestionResult:
-        """Parse, chunk, and index an academic file into the vector store."""
+    async def ingest_document(
+        self,
+        file_path: Path,
+        subject: Optional[str] = None,
+        force_reindex: bool = False
+    ) -> IngestionResult:
+        """Parse, chunk, and index an academic file into the vector store and synchronize with SQLite catalog."""
         async with self._ingest_lock:
-            logger.info(f"Starting ingestion of {file_path.name} (Subject: {subject})")
-            parsed = self.parser.parse_document(file_path, subject=subject)
-            chunks = self.chunker.chunk_document(parsed)
-            indexed_count = await self.store.add_chunks(chunks, file_sha256=parsed.sha256)
+            p = Path(file_path).resolve()
+            logger.info(f"Starting ingestion of {p.name} (Subject: {subject}, force: {force_reindex})")
 
-        self.audit.log_event(
-            event_type="document_ingestion",
-            action="ingest_file",
-            details={
-                "filename": parsed.filename,
-                "document_id": parsed.document_id,
-                "subject": subject,
-                "pages": len(parsed.pages),
-                "chunks": indexed_count,
-                "sha256": parsed.sha256
-            },
-            risk_level="low",
-            status="success"
-        )
+            # Step 1: Validation & Parsing
+            try:
+                parsed = self.parser.parse_document(p, subject=subject)
+            except DocumentParseError as e:
+                logger.warning(f"Document parsing failed for {p.name}: {e}")
+                if self.db:
+                    try:
+                        file_bytes = p.read_bytes() if p.exists() and p.is_file() else b""
+                        f_hash = hashlib.sha256(file_bytes).hexdigest() if file_bytes else "0" * 64
+                        await self.db.upsert_document(
+                            doc_id=str(uuid.uuid4()),
+                            filename=p.name,
+                            file_path=str(p),
+                            file_hash=f_hash,
+                            file_type=p.suffix.lstrip(".").lower() or "txt",
+                            file_size_bytes=len(file_bytes),
+                            subject_id=subject,
+                            page_count=1,
+                            chunk_count=0,
+                            status="failed",
+                            error_message=str(e)
+                        )
+                    except Exception:
+                        pass
+                raise
 
-        return IngestionResult(
-            document_id=parsed.document_id,
-            filename=parsed.filename,
-            file_type=parsed.file_type,
-            subject=subject,
-            total_pages=len(parsed.pages),
-            total_chunks=indexed_count,
-            total_characters=parsed.total_characters,
-            sha256=parsed.sha256
-        )
+            file_hash = parsed.file_hash or parsed.sha256
+            filename = parsed.filename
+            file_type = parsed.file_type
+            page_count = len(parsed.pages)
+            file_size_bytes = parsed.file_size_bytes
+
+            # Step 2: Check SQLite Documents Catalog & VectorStore for Duplicate / Same-Filename
+            existing_by_hash = await self.db.get_document_by_hash(file_hash) if self.db else None
+            existing_by_fn = await self.db.get_document_by_filename(filename) if self.db else None
+            store_entry = self.store._document_registry.get(filename)
+
+            # Exact Duplicate Detection:
+            if not force_reindex:
+                is_duplicate = False
+                existing_doc_id = None
+                existing_chunks = 0
+                existing_pages = page_count
+
+                if existing_by_hash and existing_by_hash.get("status") == "indexed":
+                    if store_entry and store_entry.get("sha256") == file_hash:
+                        is_duplicate = True
+                        existing_doc_id = existing_by_hash["id"]
+                        existing_chunks = existing_by_hash.get("chunk_count", store_entry.get("chunk_count", 0))
+                        existing_pages = existing_by_hash.get("page_count", page_count)
+
+                if is_duplicate:
+                    logger.info(f"Document {filename} ({file_hash[:8]}) is already indexed. Skipping re-embedding.")
+                    return IngestionResult(
+                        document_id=existing_doc_id or parsed.document_id,
+                        filename=filename,
+                        file_type=file_type,
+                        subject=existing_by_hash.get("subject_id") if existing_by_hash else subject,
+                        total_pages=existing_pages,
+                        total_chunks=existing_chunks,
+                        total_characters=parsed.total_characters,
+                        sha256=file_hash,
+                        status="already_indexed",
+                        is_duplicate=True,
+                        doc_category=parsed.doc_category,
+                        course_code=parsed.course_code
+                    )
+
+            # Step 3: Same-Filename Content Update / Replacement:
+            if existing_by_fn and existing_by_fn.get("file_hash") != file_hash:
+                logger.info(f"Document {filename} content modified on disk (replacing old hash {existing_by_fn.get('file_hash')[:8]} with {file_hash[:8]}).")
+                self.store.delete_document_chunks(filename)
+                target_doc_id = existing_by_fn["id"]
+            elif store_entry and store_entry.get("sha256") != file_hash:
+                self.store.delete_document_chunks(filename)
+                target_doc_id = store_entry.get("document_id", parsed.document_id)
+            elif force_reindex:
+                self.store.delete_document_chunks(filename)
+                target_doc_id = existing_by_fn["id"] if existing_by_fn else parsed.document_id
+            else:
+                target_doc_id = existing_by_fn["id"] if existing_by_fn else parsed.document_id
+
+            # Step 4: Track status transitions in SQLite documents catalog
+            if self.db:
+                await self.db.upsert_document(
+                    doc_id=target_doc_id,
+                    filename=filename,
+                    file_path=str(p),
+                    file_hash=file_hash,
+                    file_type=file_type,
+                    file_size_bytes=file_size_bytes,
+                    subject_id=subject,
+                    title=parsed.title,
+                    page_count=page_count,
+                    chunk_count=0,
+                    status="processing",
+                    error_message=None
+                )
+
+            # Step 5: Chunking & Indexing with Failure Recovery
+            try:
+                chunks = self.chunker.chunk_document(parsed)
+                for ch in chunks:
+                    ch.document_id = target_doc_id
+
+                indexed_count = await self.store.add_chunks(chunks, file_sha256=file_hash)
+
+                if self.db:
+                    await self.db.upsert_document(
+                        doc_id=target_doc_id,
+                        filename=filename,
+                        file_path=str(p),
+                        file_hash=file_hash,
+                        file_type=file_type,
+                        file_size_bytes=file_size_bytes,
+                        subject_id=subject,
+                        title=parsed.title,
+                        page_count=page_count,
+                        chunk_count=indexed_count,
+                        status="indexed",
+                        error_message=None
+                    )
+            except Exception as e:
+                logger.error(f"Processing/indexing failed for {filename}: {e}")
+                # Rollback partially written chunks from VectorStore so no orphan chunks remain
+                self.store.delete_document_chunks(filename)
+                if self.db:
+                    try:
+                        await self.db.upsert_document(
+                            doc_id=target_doc_id,
+                            filename=filename,
+                            file_path=str(p),
+                            file_hash=file_hash,
+                            file_type=file_type,
+                            file_size_bytes=file_size_bytes,
+                            subject_id=subject,
+                            title=parsed.title,
+                            page_count=page_count,
+                            chunk_count=0,
+                            status="failed",
+                            error_message=str(e)
+                        )
+                    except Exception:
+                        pass
+                raise
+
+            self.audit.log_event(
+                event_type="document_ingestion",
+                action="ingest_file",
+                details={
+                    "filename": filename,
+                    "document_id": target_doc_id,
+                    "subject": subject,
+                    "pages": page_count,
+                    "chunks": indexed_count,
+                    "sha256": file_hash,
+                    "doc_category": parsed.doc_category
+                },
+                risk_level="low",
+                status="success"
+            )
+
+            return IngestionResult(
+                document_id=target_doc_id,
+                filename=filename,
+                file_type=file_type,
+                subject=subject,
+                total_pages=page_count,
+                total_chunks=indexed_count,
+                total_characters=parsed.total_characters,
+                sha256=file_hash,
+                status="success",
+                is_duplicate=False,
+                doc_category=parsed.doc_category,
+                course_code=parsed.course_code
+            )
+
+    async def delete_document(
+        self,
+        doc_id_or_filename: str,
+        delete_physical_file: bool = False
+    ) -> Dict[str, Any]:
+        """Safely delete document chunks from VectorStore, metadata from SQLite catalog, and optionally disk."""
+        target = doc_id_or_filename.strip()
+        if not target:
+            raise ValueError("Document ID or filename cannot be empty.")
+
+        async with self._ingest_lock:
+            doc_record = None
+            if self.db:
+                doc_record = await self.db.get_document(target)
+                if not doc_record:
+                    doc_record = await self.db.get_document_by_filename(target)
+
+            filename = doc_record["filename"] if doc_record else target
+            doc_id = doc_record["id"] if doc_record else target
+
+            # Remove from VectorStore
+            chunks_removed = self.store.delete_document_chunks(filename)
+            if doc_id != filename:
+                chunks_removed += self.store.delete_document_chunks(doc_id)
+
+            # Remove from SQLite catalog
+            db_deleted = False
+            if self.db:
+                db_deleted = await self.db.delete_document_record(doc_id)
+                if not db_deleted and filename != doc_id:
+                    db_deleted = await self.db.delete_document_record(filename)
+
+            # Optionally remove physical file with path traversal defense
+            physical_deleted = False
+            if delete_physical_file:
+                doc_dir = self.settings.DOCUMENTS_DIR.resolve()
+                p = (doc_dir / filename).resolve()
+                if p.is_relative_to(doc_dir) and p.exists() and p.is_file():
+                    p.unlink()
+                    physical_deleted = True
+                elif doc_record and doc_record.get("file_path"):
+                    rp = Path(doc_record["file_path"]).resolve()
+                    if rp.is_relative_to(doc_dir) and rp.exists() and rp.is_file():
+                        rp.unlink()
+                        physical_deleted = True
+
+            self.audit.log_event(
+                event_type="document_deletion",
+                action="delete_document",
+                details={
+                    "target": target,
+                    "doc_id": doc_id,
+                    "filename": filename,
+                    "chunks_removed": chunks_removed,
+                    "db_deleted": db_deleted,
+                    "physical_deleted": physical_deleted
+                },
+                risk_level="medium" if delete_physical_file else "low",
+                status="success"
+            )
+
+            return {
+                "ok": True,
+                "document_id": doc_id,
+                "filename": filename,
+                "chunks_removed": chunks_removed,
+                "db_deleted": db_deleted,
+                "physical_file_deleted": physical_deleted
+            }
+
+    async def retry_failed_documents(self) -> Dict[str, Any]:
+        """Retry ingestion for any documents in the SQLite catalog marked with status='failed'."""
+        if not self.db:
+            return {"total_retried": 0, "succeeded": 0, "failed": 0, "details": []}
+
+        failed_docs = await self.db.list_documents(status="failed")
+        succeeded = 0
+        failed = 0
+        details = []
+
+        for rec in failed_docs:
+            fn = rec["filename"]
+            fp = Path(rec["file_path"])
+            if not fp.exists():
+                fp = self.settings.DOCUMENTS_DIR / fn
+
+            if not fp.exists() or not fp.is_file():
+                failed += 1
+                details.append({"filename": fn, "status": "failed", "error": "Physical file not found"})
+                continue
+
+            try:
+                res = await self.ingest_document(fp, subject=rec.get("subject_id"), force_reindex=True)
+                succeeded += 1
+                details.append({"filename": fn, "status": "indexed", "chunks": res.total_chunks})
+            except Exception as e:
+                failed += 1
+                details.append({"filename": fn, "status": "failed", "error": str(e)})
+
+        return {
+            "total_retried": len(failed_docs),
+            "succeeded": succeeded,
+            "failed": failed,
+            "details": details
+        }
 
     async def retrieve_grounded_context(
         self,
@@ -138,8 +407,8 @@ class RAGService:
         )
 
     async def reindex_all_documents(self, force: bool = False) -> Dict[str, Any]:
-        """Safely reindex all documents stored in the documents directory with idempotency."""
-        doc_dir = settings.DOCUMENTS_DIR
+        """Safely reindex all documents stored in the documents directory with SQLite catalog synchronization."""
+        doc_dir = self.settings.DOCUMENTS_DIR
         if not doc_dir.exists():
             return {"status": "no_documents_directory", "reindexed": 0, "skipped": 0, "failed": 0}
 
@@ -153,23 +422,18 @@ class RAGService:
 
         for file_path in files:
             try:
-                import hashlib
-                current_sha256 = hashlib.sha256(file_path.read_bytes()).hexdigest()
-                existing_entry = self.store._document_registry.get(file_path.name)
-
-                if not force and existing_entry and existing_entry.get("sha256") == current_sha256:
+                res = await self.ingest_document(file_path, force_reindex=force)
+                if res.is_duplicate:
                     skipped += 1
-                    details.append({"filename": file_path.name, "action": "skipped_unchanged"})
-                    continue
-
-                res = await self.ingest_document(file_path, subject=existing_entry.get("subject") if existing_entry else None)
-                reindexed += 1
-                details.append({
-                    "filename": file_path.name,
-                    "action": "reindexed",
-                    "chunks": res.total_chunks,
-                    "pages": res.total_pages
-                })
+                    details.append({"filename": file_path.name, "action": "skipped_duplicate"})
+                else:
+                    reindexed += 1
+                    details.append({
+                        "filename": file_path.name,
+                        "action": "reindexed",
+                        "chunks": res.total_chunks,
+                        "pages": res.total_pages
+                    })
             except Exception as e:
                 failed += 1
                 logger.error(f"Reindexing failed for {file_path.name}: {e}")

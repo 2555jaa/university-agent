@@ -70,6 +70,19 @@ def isolated_sandbox(monkeypatch, tmp_path):
     monkeypatch.setattr("app.security.validator.security_validator", container.security_validator)
     monkeypatch.setattr("app.knowledge.embeddings.embedding_manager", container.embedding_manager)
 
+    # In app.agent.orchestrator module globals:
+    monkeypatch.setattr("app.agent.orchestrator.db", container.db, raising=False)
+    monkeypatch.setattr("app.agent.orchestrator.rag_service", container.rag_service, raising=False)
+    monkeypatch.setattr("app.agent.orchestrator.router", container.router, raising=False)
+    monkeypatch.setattr("app.agent.orchestrator.audit_logger", container.audit_logger, raising=False)
+    monkeypatch.setattr("app.agent.orchestrator.settings", test_settings, raising=False)
+
+    # In app.knowledge.rag_service and vector_store:
+    monkeypatch.setattr("app.knowledge.rag_service.vector_store", container.vector_store, raising=False)
+    monkeypatch.setattr("app.knowledge.rag_service.default_db", container.db, raising=False)
+    monkeypatch.setattr("app.knowledge.rag_service.embedding_manager", container.embedding_manager, raising=False)
+    monkeypatch.setattr("app.knowledge.vector_store.embedding_manager", container.embedding_manager, raising=False)
+
     # In app.api.routes module globals:
     monkeypatch.setattr("app.api.routes.db", container.db, raising=False)
     monkeypatch.setattr("app.api.routes.vector_store", container.vector_store, raising=False)

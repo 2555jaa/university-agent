@@ -267,13 +267,16 @@ class VectorStore:
         return True
 
     def delete_document_chunks(self, filename: str) -> int:
-        """Remove existing chunks for a filename to prevent duplicates and enable clean re-ingestion."""
-        removed_cids = [cid for cid, ch in self._fallback_chunks.items() if ch.filename == filename]
+        """Remove existing chunks for a filename or document_id to prevent duplicates and enable clean re-ingestion."""
+        removed_cids = [cid for cid, ch in self._fallback_chunks.items() if ch.filename == filename or ch.document_id == filename]
         for cid in removed_cids:
             self._fallback_chunks.pop(cid, None)
             self._fallback_vectors.pop(cid, None)
 
         self._document_registry.pop(filename, None)
+        matching_keys = [k for k, v in self._document_registry.items() if v.get("document_id") == filename]
+        for k in matching_keys:
+            self._document_registry.pop(k, None)
 
         if self.collection is not None and removed_cids:
             try:
@@ -475,7 +478,11 @@ class VectorStore:
 
     def get_index_status(self) -> Dict[str, Any]:
         """Return diagnostic status of the vector index."""
+        backend_name = "chromadb" if getattr(self, "chroma_client", None) is not None else "fallback_json"
         return {
+            "mode": backend_name,
+            "backend": backend_name,
+            "status": "ok",
             "index_version": self._index_metadata.get("index_version", self.INDEX_VERSION),
             "embedding_provider": self._index_metadata.get("embedding_provider", "unknown"),
             "embedding_model": self._index_metadata.get("embedding_model", "unknown"),
@@ -484,9 +491,9 @@ class VectorStore:
             "total_documents": len(self._document_registry),
             "total_chunks": len(self._fallback_chunks),
             "updated_at": self._index_metadata.get("updated_at", 0),
-            "hybrid_search_enabled": getattr(settings, "RAG_HYBRID_SEARCH", True),
-            "similarity_threshold": getattr(settings, "RAG_SIMILARITY_THRESHOLD", 0.35),
-            "min_semantic_only_score": getattr(settings, "RAG_MIN_SEMANTIC_ONLY_SCORE", 0.50)
+            "hybrid_search_enabled": getattr(self.settings, "RAG_HYBRID_SEARCH", True),
+            "similarity_threshold": getattr(self.settings, "RAG_SIMILARITY_THRESHOLD", 0.35),
+            "min_semantic_only_score": getattr(self.settings, "RAG_MIN_SEMANTIC_ONLY_SCORE", 0.50)
         }
 
 

@@ -70,11 +70,11 @@ class SecurityValidator:
     ):
         self.settings = settings_obj or settings
         if allowed_roots is not None:
-            self._custom_roots = True
             self._allowed_roots = [p.resolve() for p in allowed_roots]
         else:
-            self._custom_roots = False
-            self._allowed_roots = []
+            workspace_dir = (self.settings.BASE_DIR / "workspace").resolve()
+            documents_dir = self.settings.DOCUMENTS_DIR.resolve()
+            self._allowed_roots = [documents_dir, workspace_dir]
 
         self._pending_approvals: Dict[str, ApprovalRequest] = {}
         # Approval state is shared by API worker threads; consumption must be atomic.
@@ -82,15 +82,10 @@ class SecurityValidator:
 
     @property
     def allowed_roots(self) -> List[Path]:
-        if self._custom_roots:
-            return self._allowed_roots
-        workspace_dir = (self.settings.BASE_DIR / "workspace").resolve()
-        documents_dir = self.settings.DOCUMENTS_DIR.resolve()
-        return [documents_dir, workspace_dir]
+        return self._allowed_roots
 
     @allowed_roots.setter
     def allowed_roots(self, roots: List[Path]) -> None:
-        self._custom_roots = True
         self._allowed_roots = [p.resolve() for p in roots]
 
     def is_sensitive_target(self, resolved_target: Path) -> bool:
@@ -106,13 +101,13 @@ class SecurityValidator:
         if resolved_target.suffix.lower() in self.SENSITIVE_EXTENSIONS:
             return True
         # Block access to app, tests, scripts dirs
-        app_dir = (settings.BASE_DIR / "app").resolve()
+        app_dir = (self.settings.BASE_DIR / "app").resolve()
         if app_dir == resolved_target or app_dir in resolved_target.parents:
             return True
-        tests_dir = (settings.BASE_DIR / "tests").resolve()
+        tests_dir = (self.settings.BASE_DIR / "tests").resolve()
         if tests_dir == resolved_target or tests_dir in resolved_target.parents:
             return True
-        scripts_dir = (settings.BASE_DIR / "scripts").resolve()
+        scripts_dir = (self.settings.BASE_DIR / "scripts").resolve()
         if scripts_dir == resolved_target or scripts_dir in resolved_target.parents:
             return True
         return False

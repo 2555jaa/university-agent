@@ -37,7 +37,7 @@ def create_service_container(custom_settings: Optional[Settings] = None) -> Serv
     embeddings = EmbeddingManager(settings_obj=s)
     store = VectorStore(persist_dir=s.CHROMA_DIR, settings_obj=s, embedding_mgr=embeddings)
     model_router = ModelRouter(settings_obj=s)
-    rag = RAGService(store=store, audit=audit, settings_obj=s)
+    rag = RAGService(store=store, audit=audit, db=database, settings_obj=s)
     agent = AcademicAgent(
         router_instance=model_router,
         rag_instance=rag,

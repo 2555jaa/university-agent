@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Optional
 import shutil
 import uuid
 import time
-from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile, status
+from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile, status, Query
 from pydantic import BaseModel, Field
 
 from app.config import settings
@@ -35,17 +35,51 @@ async def health_check(request: Request):
     ollama_ok = await OllamaProvider(settings_obj=s).is_available()
     cloud_ok = await CloudAIProvider(settings_obj=s).is_available()
     emb_info = await services.embedding_manager.get_active_info()
+    db_health = await services.db.check_health()
+    vec_status = services.vector_store.get_index_status()
+
+    is_healthy = db_health.get("status") == "ok"
+    status_str = "healthy" if is_healthy else "degraded"
+
     return {
-        "status": "healthy",
+        "status": status_str,
+        "environment": s.APP_ENV,
         "app_name": s.APP_NAME,
         "version": s.APP_VERSION,
+        "database": db_health,
+        "vector_store": {
+            "mode": vec_status.get("mode", "fallback_json"),
+            "status": vec_status.get("status", "ok"),
+            "backend": vec_status.get("backend", "fallback_json"),
+            "total_documents": vec_status.get("total_documents", 0),
+            "total_chunks": vec_status.get("total_chunks", 0),
+        },
+        "embeddings": {
+            "provider": emb_info.provider,
+            "model": emb_info.model,
+            "is_neural": emb_info.is_neural,
+            "dimension": emb_info.dimension,
+        },
+        "llm_providers": {
+            "ollama": {
+                "available": ollama_ok,
+                "base_url": s.OLLAMA_BASE_URL,
+                "model": s.LOCAL_MODEL,
+            },
+            "cloud": {
+                "available": cloud_ok,
+                "enabled": s.CLOUD_ENABLED,
+                "model": s.CLOUD_MODEL,
+            },
+        },
+        # Backwards compatible top-level fields
         "ollama_available": ollama_ok,
         "cloud_available": cloud_ok,
         "local_model": s.LOCAL_MODEL,
         "embedding_provider": emb_info.provider,
         "embedding_model": emb_info.model,
         "embedding_is_neural": emb_info.is_neural,
-        "embedding_dimension": emb_info.dimension
+        "embedding_dimension": emb_info.dimension,
     }
 
 
@@ -68,17 +102,44 @@ async def system_status(request: Request):
 
     ollama_provider = OllamaProvider(settings_obj=s)
     loaded_models = await ollama_provider.get_loaded_models()
+    ollama_ok = await ollama_provider.is_available()
+    cloud_ok = await CloudAIProvider(settings_obj=s).is_available()
     emb_info = await services.embedding_manager.get_active_info()
+    db_health = await services.db.check_health()
+    vec_status = services.vector_store.get_index_status()
 
     return {
+        "environment": s.APP_ENV,
         "memory": mem_info,
+        "database": db_health,
+        "vector_store": vec_status,
+        "embedding": emb_info.model_dump(),
+        "embeddings": {
+            "provider": emb_info.provider,
+            "model": emb_info.model,
+            "is_neural": emb_info.is_neural,
+            "dimension": emb_info.dimension,
+        },
+        "llm_providers": {
+            "ollama": {
+                "connected": ollama_ok,
+                "base_url": s.OLLAMA_BASE_URL,
+                "active_model": s.LOCAL_MODEL,
+                "available_models": loaded_models,
+            },
+            "cloud": {
+                "enabled": s.CLOUD_ENABLED,
+                "available": cloud_ok,
+                "model": s.CLOUD_MODEL,
+            },
+        },
+        # Backwards compatible top-level fields
         "ollama_base_url": s.OLLAMA_BASE_URL,
-        "ollama_connected": await ollama_provider.is_available(),
+        "ollama_connected": ollama_ok,
         "available_local_models": loaded_models,
         "active_local_model": s.LOCAL_MODEL,
         "cloud_routing_enabled": s.CLOUD_ENABLED,
-        "embedding": emb_info.model_dump(),
-        "vector_index": services.vector_store.get_index_status()
+        "vector_index": vec_status,
     }
 
 
@@ -210,6 +271,40 @@ async def search_documents(req: SearchQuery, request: Request):
         }
         for r in results
     ]
+
+
+@router.get("/documents/{doc_id}")
+async def get_document_details(doc_id: str, request: Request):
+    services = get_services(request)
+    doc = await services.db.get_document(doc_id)
+    if not doc:
+        doc = await services.db.get_document_by_filename(doc_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail=f"Document '{doc_id}' not found.")
+    return doc
+
+
+@router.delete("/documents/{doc_id}")
+async def delete_document(
+    doc_id: str,
+    request: Request,
+    delete_file: bool = Query(False, description="Whether to also delete the physical file on disk")
+):
+    services = get_services(request)
+    try:
+        result = await services.rag_service.delete_document(doc_id, delete_physical_file=delete_file)
+        if not result["db_deleted"] and result["chunks_removed"] == 0 and not result["physical_file_deleted"]:
+            raise HTTPException(status_code=404, detail=f"Document '{doc_id}' not found.")
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to delete document: {e}")
+
+
+@router.post("/documents/retry-failed")
+async def retry_failed_documents(request: Request):
+    return await get_services(request).rag_service.retry_failed_documents()
 
 
 # --- MEMORY, PROGRESS & TASKS ---
