@@ -53,6 +53,7 @@ class Settings(BaseSettings):
     RAG_TOP_K: int = 4
     RAG_HYBRID_SEARCH: bool = True
     RAG_HYBRID_ALPHA: float = 0.65
+    MAX_CONTEXT_TOKENS: int = 4000
 
     CLOUD_ENABLED: bool = False
     CLOUD_PROVIDER: Literal["gemini", "openai"] = "gemini"
@@ -117,6 +118,13 @@ class Settings(BaseSettings):
     def validate_hybrid_alpha(cls, value: float) -> float:
         if not (0.0 <= value <= 1.0):
             raise ValueError("RAG_HYBRID_ALPHA must be between 0.0 and 1.0")
+        return value
+
+    @field_validator("MAX_CONTEXT_TOKENS")
+    @classmethod
+    def validate_max_context_tokens(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("MAX_CONTEXT_TOKENS must be greater than 0")
         return value
 
     @field_validator("MAX_UPLOAD_SIZE_MB")

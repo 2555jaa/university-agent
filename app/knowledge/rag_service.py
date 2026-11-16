@@ -3,8 +3,10 @@
 import asyncio
 from enum import Enum
 import hashlib
+import html
 import logging
 from pathlib import Path
+import re
 from typing import Any, Dict, List, Optional
 import uuid
 from pydantic import BaseModel, Field
@@ -83,92 +85,125 @@ class RAGService:
     ) -> IngestionResult:
         """Parse, chunk, and index an academic file into the vector store and synchronize with SQLite catalog."""
         async with self._ingest_lock:
-            p = Path(file_path).resolve()
-            logger.info(f"Starting ingestion of {p.name} (Subject: {subject}, force: {force_reindex})")
+            return await self._ingest_document_unlocked(file_path, subject=subject, force_reindex=force_reindex)
 
-            # Step 1: Validation & Parsing
-            try:
-                parsed = self.parser.parse_document(p, subject=subject)
-            except DocumentParseError as e:
-                logger.warning(f"Document parsing failed for {p.name}: {e}")
-                if self.db:
-                    try:
-                        file_bytes = p.read_bytes() if p.exists() and p.is_file() else b""
-                        f_hash = hashlib.sha256(file_bytes).hexdigest() if file_bytes else "0" * 64
-                        await self.db.upsert_document(
-                            doc_id=str(uuid.uuid4()),
-                            filename=p.name,
-                            file_path=str(p),
-                            file_hash=f_hash,
-                            file_type=p.suffix.lstrip(".").lower() or "txt",
-                            file_size_bytes=len(file_bytes),
-                            subject_id=subject,
-                            page_count=1,
-                            chunk_count=0,
-                            status="failed",
-                            error_message=str(e)
-                        )
-                    except Exception:
-                        pass
-                raise
+    async def _ingest_document_unlocked(
+        self,
+        file_path: Path,
+        subject: Optional[str] = None,
+        force_reindex: bool = False
+    ) -> IngestionResult:
+        """Internal unlocked ingestion implementation."""
+        p = Path(file_path).resolve()
+        logger.info(f"Starting ingestion of {p.name} (Subject: {subject}, force: {force_reindex})")
 
-            file_hash = parsed.file_hash or parsed.sha256
-            filename = parsed.filename
-            file_type = parsed.file_type
-            page_count = len(parsed.pages)
-            file_size_bytes = parsed.file_size_bytes
-
-            # Step 2: Check SQLite Documents Catalog & VectorStore for Duplicate / Same-Filename
-            existing_by_hash = await self.db.get_document_by_hash(file_hash) if self.db else None
-            existing_by_fn = await self.db.get_document_by_filename(filename) if self.db else None
-            store_entry = self.store._document_registry.get(filename)
-
-            # Exact Duplicate Detection:
-            if not force_reindex:
-                is_duplicate = False
-                existing_doc_id = None
-                existing_chunks = 0
-                existing_pages = page_count
-
-                if existing_by_hash and existing_by_hash.get("status") == "indexed":
-                    if store_entry and store_entry.get("sha256") == file_hash:
-                        is_duplicate = True
-                        existing_doc_id = existing_by_hash["id"]
-                        existing_chunks = existing_by_hash.get("chunk_count", store_entry.get("chunk_count", 0))
-                        existing_pages = existing_by_hash.get("page_count", page_count)
-
-                if is_duplicate:
-                    logger.info(f"Document {filename} ({file_hash[:8]}) is already indexed. Skipping re-embedding.")
-                    return IngestionResult(
-                        document_id=existing_doc_id or parsed.document_id,
-                        filename=filename,
-                        file_type=file_type,
-                        subject=existing_by_hash.get("subject_id") if existing_by_hash else subject,
-                        total_pages=existing_pages,
-                        total_chunks=existing_chunks,
-                        total_characters=parsed.total_characters,
-                        sha256=file_hash,
-                        status="already_indexed",
-                        is_duplicate=True,
-                        doc_category=parsed.doc_category,
-                        course_code=parsed.course_code
+        # Step 1: Validation & Parsing
+        try:
+            parsed = self.parser.parse_document(p, subject=subject)
+        except DocumentParseError as e:
+            logger.warning(f"Document parsing failed for {p.name}: {e}")
+            if self.db:
+                try:
+                    file_bytes = p.read_bytes() if p.exists() and p.is_file() else b""
+                    f_hash = hashlib.sha256(file_bytes).hexdigest() if file_bytes else "0" * 64
+                    await self.db.upsert_document(
+                        doc_id=str(uuid.uuid4()),
+                        filename=p.name,
+                        file_path=str(p),
+                        file_hash=f_hash,
+                        file_type=p.suffix.lstrip(".").lower() or "txt",
+                        file_size_bytes=len(file_bytes),
+                        subject_id=subject,
+                        page_count=1,
+                        chunk_count=0,
+                        status="failed",
+                        error_message=str(e)
                     )
+                except Exception:
+                    pass
+            raise
 
-            # Step 3: Same-Filename Content Update / Replacement:
-            if existing_by_fn and existing_by_fn.get("file_hash") != file_hash:
-                logger.info(f"Document {filename} content modified on disk (replacing old hash {existing_by_fn.get('file_hash')[:8]} with {file_hash[:8]}).")
-                self.store.delete_document_chunks(filename)
-                target_doc_id = existing_by_fn["id"]
-            elif store_entry and store_entry.get("sha256") != file_hash:
-                self.store.delete_document_chunks(filename)
-                target_doc_id = store_entry.get("document_id", parsed.document_id)
-            elif force_reindex:
-                self.store.delete_document_chunks(filename)
-                target_doc_id = existing_by_fn["id"] if existing_by_fn else parsed.document_id
-            else:
-                target_doc_id = existing_by_fn["id"] if existing_by_fn else parsed.document_id
+        file_hash = parsed.file_hash or parsed.sha256
+        filename = parsed.filename
+        file_type = parsed.file_type
+        page_count = len(parsed.pages)
+        file_size_bytes = parsed.file_size_bytes
 
-            # Step 4: Track status transitions in SQLite documents catalog
+        # Step 2: Check SQLite Documents Catalog & VectorStore for Duplicate / Same-Filename
+        existing_by_hash = await self.db.get_document_by_hash(file_hash) if self.db else None
+        existing_by_fn = await self.db.get_document_by_filename(filename) if self.db else None
+        store_entry = self.store._document_registry.get(filename)
+
+        # Exact Duplicate Detection:
+        if not force_reindex:
+            is_duplicate = False
+            existing_doc_id = None
+            existing_chunks = 0
+            existing_pages = page_count
+
+            if existing_by_hash and existing_by_hash.get("status") == "indexed":
+                if store_entry and store_entry.get("sha256") == file_hash:
+                    is_duplicate = True
+                    existing_doc_id = existing_by_hash["id"]
+                    existing_chunks = existing_by_hash.get("chunk_count", store_entry.get("chunk_count", 0))
+                    existing_pages = existing_by_hash.get("page_count", page_count)
+
+            if is_duplicate:
+                logger.info(f"Document {filename} ({file_hash[:8]}) is already indexed. Skipping re-embedding.")
+                return IngestionResult(
+                    document_id=existing_doc_id or parsed.document_id,
+                    filename=filename,
+                    file_type=file_type,
+                    subject=existing_by_hash.get("subject_id") if existing_by_hash else subject,
+                    total_pages=existing_pages,
+                    total_chunks=existing_chunks,
+                    total_characters=parsed.total_characters,
+                    sha256=file_hash,
+                    status="already_indexed",
+                    is_duplicate=True,
+                    doc_category=parsed.doc_category,
+                    course_code=parsed.course_code
+                )
+
+        # Step 3: Same-Filename Content Update / Replacement:
+        if existing_by_fn and existing_by_fn.get("file_hash") != file_hash:
+            logger.info(f"Document {filename} content modified on disk (replacing old hash {existing_by_fn.get('file_hash')[:8]} with {file_hash[:8]}).")
+            self.store.delete_document_chunks(filename)
+            target_doc_id = existing_by_fn["id"]
+        elif store_entry and store_entry.get("sha256") != file_hash:
+            self.store.delete_document_chunks(filename)
+            target_doc_id = store_entry.get("document_id", parsed.document_id)
+        elif force_reindex:
+            self.store.delete_document_chunks(filename)
+            target_doc_id = existing_by_fn["id"] if existing_by_fn else parsed.document_id
+        else:
+            target_doc_id = existing_by_fn["id"] if existing_by_fn else parsed.document_id
+
+        # Step 4: Track status transitions in SQLite documents catalog
+        if self.db:
+            await self.db.upsert_document(
+                doc_id=target_doc_id,
+                filename=filename,
+                file_path=str(p),
+                file_hash=file_hash,
+                file_type=file_type,
+                file_size_bytes=file_size_bytes,
+                subject_id=subject,
+                title=parsed.title,
+                page_count=page_count,
+                chunk_count=0,
+                status="processing",
+                error_message=None
+            )
+
+        # Step 5: Chunking & Indexing with Failure Recovery
+        try:
+            chunks = self.chunker.chunk_document(parsed)
+            for ch in chunks:
+                ch.document_id = target_doc_id
+
+            indexed_count = await self.store.add_chunks(chunks, file_sha256=file_hash)
+
             if self.db:
                 await self.db.upsert_document(
                     doc_id=target_doc_id,
@@ -180,20 +215,16 @@ class RAGService:
                     subject_id=subject,
                     title=parsed.title,
                     page_count=page_count,
-                    chunk_count=0,
-                    status="processing",
+                    chunk_count=indexed_count,
+                    status="indexed",
                     error_message=None
                 )
-
-            # Step 5: Chunking & Indexing with Failure Recovery
-            try:
-                chunks = self.chunker.chunk_document(parsed)
-                for ch in chunks:
-                    ch.document_id = target_doc_id
-
-                indexed_count = await self.store.add_chunks(chunks, file_sha256=file_hash)
-
-                if self.db:
+        except Exception as e:
+            logger.error(f"Processing/indexing failed for {filename}: {e}")
+            # Rollback partially written chunks from VectorStore so no orphan chunks remain
+            self.store.delete_document_chunks(filename)
+            if self.db:
+                try:
                     await self.db.upsert_document(
                         doc_id=target_doc_id,
                         filename=filename,
@@ -204,64 +235,44 @@ class RAGService:
                         subject_id=subject,
                         title=parsed.title,
                         page_count=page_count,
-                        chunk_count=indexed_count,
-                        status="indexed",
-                        error_message=None
+                        chunk_count=0,
+                        status="failed",
+                        error_message=str(e)
                     )
-            except Exception as e:
-                logger.error(f"Processing/indexing failed for {filename}: {e}")
-                # Rollback partially written chunks from VectorStore so no orphan chunks remain
-                self.store.delete_document_chunks(filename)
-                if self.db:
-                    try:
-                        await self.db.upsert_document(
-                            doc_id=target_doc_id,
-                            filename=filename,
-                            file_path=str(p),
-                            file_hash=file_hash,
-                            file_type=file_type,
-                            file_size_bytes=file_size_bytes,
-                            subject_id=subject,
-                            title=parsed.title,
-                            page_count=page_count,
-                            chunk_count=0,
-                            status="failed",
-                            error_message=str(e)
-                        )
-                    except Exception:
-                        pass
-                raise
+                except Exception:
+                    pass
+            raise
 
-            self.audit.log_event(
-                event_type="document_ingestion",
-                action="ingest_file",
-                details={
-                    "filename": filename,
-                    "document_id": target_doc_id,
-                    "subject": subject,
-                    "pages": page_count,
-                    "chunks": indexed_count,
-                    "sha256": file_hash,
-                    "doc_category": parsed.doc_category
-                },
-                risk_level="low",
-                status="success"
-            )
+        self.audit.log_event(
+            event_type="document_ingestion",
+            action="ingest_file",
+            details={
+                "filename": filename,
+                "document_id": target_doc_id,
+                "subject": subject,
+                "pages": page_count,
+                "chunks": indexed_count,
+                "sha256": file_hash,
+                "doc_category": parsed.doc_category
+            },
+            risk_level="low",
+            status="success"
+        )
 
-            return IngestionResult(
-                document_id=target_doc_id,
-                filename=filename,
-                file_type=file_type,
-                subject=subject,
-                total_pages=page_count,
-                total_chunks=indexed_count,
-                total_characters=parsed.total_characters,
-                sha256=file_hash,
-                status="success",
-                is_duplicate=False,
-                doc_category=parsed.doc_category,
-                course_code=parsed.course_code
-            )
+        return IngestionResult(
+            document_id=target_doc_id,
+            filename=filename,
+            file_type=file_type,
+            subject=subject,
+            total_pages=page_count,
+            total_chunks=indexed_count,
+            total_characters=parsed.total_characters,
+            sha256=file_hash,
+            status="success",
+            is_duplicate=False,
+            doc_category=parsed.doc_category,
+            course_code=parsed.course_code
+        )
 
     async def delete_document(
         self,
@@ -369,6 +380,25 @@ class RAGService:
             "details": details
         }
 
+    @staticmethod
+    def estimate_tokens(text: str) -> int:
+        """Fast, deterministic token count estimation (~4 characters per token)."""
+        if not text:
+            return 0
+        return max(1, len(text) // 4)
+
+    @staticmethod
+    def _escape_xml_fences(text: str) -> str:
+        """Escape or neutralize any literal <source> or </source> tags to prevent injection escapes."""
+        if not text:
+            return ""
+
+        def _repl(match):
+            tag_content = match.group(0)
+            return tag_content.replace("<", "&lt;").replace(">", "&gt;")
+
+        return re.sub(r'<\s*/?\s*source(?:\s+[^>]*)?>', _repl, text, flags=re.IGNORECASE)
+
     async def retrieve_grounded_context(
         self,
         query: str,
@@ -376,11 +406,13 @@ class RAGService:
         top_k: Optional[int] = None,
         score_threshold: Optional[float] = None,
         filters: Optional[Dict[str, Any]] = None,
-        hybrid: Optional[bool] = None
+        hybrid: Optional[bool] = None,
+        max_tokens: Optional[int] = None
     ) -> GroundedContext:
-        """Retrieve relevant passages and format them with explicit, heading-aware citation markers.
+        """Retrieve relevant passages and format them with explicit, XML-fenced source markers.
 
-        Enforces strict relevance thresholds to prevent hallucination.
+        Enforces strict relevance thresholds and token-aware context window limits.
+        Neutralizes prompt injection attempts within chunk text.
         Returns structured ContextStatus (FOUND, INSUFFICIENT_EVIDENCE, NO_DOCUMENTS).
         """
         threshold_applied = score_threshold if score_threshold is not None else getattr(self.settings, "RAG_SIMILARITY_THRESHOLD", 0.45)
@@ -411,16 +443,100 @@ class RAGService:
                 threshold_applied=threshold_applied
             )
 
-        context_blocks = []
-        citations = []
+        # 1. Sort chunks by final_score / score descending
+        sorted_results = sorted(
+            results,
+            key=lambda r: getattr(r, "final_score", getattr(r, "score", 0.0)),
+            reverse=True
+        )
 
-        for i, res in enumerate(results, 1):
+        context_window_limit = max_tokens or getattr(self.settings, "MAX_CONTEXT_TOKENS", 4000)
+        cumulative_token_estimate = 0
+        context_blocks: List[str] = []
+        citations: List[Dict[str, Any]] = []
+
+        for i, res in enumerate(sorted_results, 1):
             ref_tag = f"[{i}]"
-            heading_info = f" § {res.heading}" if res.heading else ""
-            context_blocks.append(
-                f"{ref_tag} Source: {res.filename} | Page {res.page_number}{heading_info} | Score: {res.score}\n"
-                f"{res.text.strip()}"
+            heading_attr = html.escape(str(res.heading or ""))
+            doc_attr = html.escape(str(res.filename or ""))
+            page_attr = str(res.page_number)
+
+            # Strip or escape any literal <source> or </source> tags to prevent injection escapes
+            safe_text = self._escape_xml_fences(res.text.strip())
+
+            chunk_xml = (
+                f'<source id="{ref_tag}" document="{doc_attr}" page="{page_attr}" heading="{heading_attr}">\n'
+                f'{safe_text}\n'
+                f'</source>'
             )
+            chunk_tokens = self.estimate_tokens(chunk_xml)
+
+            # Edge Case 3: First chunk itself exceeds the window limit
+            if i == 1 and chunk_tokens > context_window_limit:
+                overhead = len(f'<source id="{ref_tag}" document="{doc_attr}" page="{page_attr}" heading="{heading_attr}">\n\n</source>')
+                truncation_marker = "\n...[TRUNCATED]"
+                target_chars = max(40, (context_window_limit * 4) - overhead - len(truncation_marker))
+                safe_text = safe_text[:target_chars].rstrip() + truncation_marker
+                chunk_xml = (
+                    f'<source id="{ref_tag}" document="{doc_attr}" page="{page_attr}" heading="{heading_attr}">\n'
+                    f'{safe_text}\n'
+                    f'</source>'
+                )
+                chunk_tokens = self.estimate_tokens(chunk_xml)
+                cumulative_token_estimate += chunk_tokens
+                context_blocks.append(chunk_xml)
+                citations.append({
+                    "index": i,
+                    "chunk_id": res.chunk_id,
+                    "filename": res.filename,
+                    "page_number": res.page_number,
+                    "heading": res.heading,
+                    "subject": res.subject,
+                    "score": res.score,
+                    "semantic_score": res.semantic_score,
+                    "lexical_score": res.lexical_score,
+                    "snippet": res.text[:200]
+                })
+                logger.warning(
+                    f"First chunk exceeded MAX_CONTEXT_TOKENS ({context_window_limit}); safely truncated with ...[TRUNCATED]."
+                )
+                if self.audit:
+                    self.audit.log_event(
+                        event_type="rag_retrieval",
+                        action="context_truncated_due_to_limit",
+                        details={
+                            "reason": "first_chunk_exceeded_window",
+                            "chunk_id": res.chunk_id,
+                            "window_limit": context_window_limit
+                        },
+                        risk_level="low",
+                        status="success"
+                    )
+                break
+
+            # Cumulative limit check for subsequent chunks
+            if cumulative_token_estimate + chunk_tokens > context_window_limit:
+                omitted_count = len(sorted_results) - len(context_blocks)
+                logger.warning(
+                    f"Context truncated due to limit: cumulative tokens {cumulative_token_estimate} + {chunk_tokens} "
+                    f"exceeds MAX_CONTEXT_TOKENS ({context_window_limit}). Omitted {omitted_count} lower-relevance chunks."
+                )
+                if self.audit:
+                    self.audit.log_event(
+                        event_type="rag_retrieval",
+                        action="context_truncated_due_to_limit",
+                        details={
+                            "cumulative_tokens": cumulative_token_estimate,
+                            "omitted_chunks": omitted_count,
+                            "window_limit": context_window_limit
+                        },
+                        risk_level="low",
+                        status="success"
+                    )
+                break
+
+            cumulative_token_estimate += chunk_tokens
+            context_blocks.append(chunk_xml)
             citations.append({
                 "index": i,
                 "chunk_id": res.chunk_id,
@@ -434,7 +550,7 @@ class RAGService:
                 "snippet": res.text[:200]
             })
 
-        formatted_context = "\n\n---\n\n".join(context_blocks)
+        formatted_context = "<context>\n" + "\n\n".join(context_blocks) + "\n</context>"
         return GroundedContext(
             context_text=formatted_context,
             citations=citations,
@@ -584,7 +700,7 @@ class RAGService:
                 for p in doc_dir.iterdir():
                     if p.is_file() and p.suffix.lower() in allowed_exts and p.name not in processed_filenames:
                         try:
-                            res = await self.ingest_document(p, force_reindex=True)
+                            res = await self._ingest_document_unlocked(p, force_reindex=True)
                             reindexed_count += 1
                             total_chunks += res.total_chunks
                             details.append({

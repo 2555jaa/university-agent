@@ -13,6 +13,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from app.config import get_settings
 from app.memory.database import DatabaseManager
+from app.knowledge.embeddings import EmbeddingManager
 from app.knowledge.vector_store import VectorStore
 from app.knowledge.rag_service import RAGService
 
@@ -27,6 +28,8 @@ def parse_args():
                         help="Custom path to Chroma persistence directory.")
     parser.add_argument("--documents-dir", type=str, default=None,
                         help="Custom path to physical documents directory.")
+    parser.add_argument("--provider", type=str, default=None, choices=["auto", "ollama", "deterministic_hash"],
+                        help="Embedding provider override.")
     parser.add_argument("--force", action="store_true",
                         help="Force re-embedding of all documents.")
     parser.add_argument("--verify-only", action="store_true",
@@ -61,10 +64,13 @@ async def main_async(args):
         overrides["CHROMA_DIR"] = Path(args.chroma_dir).resolve()
     if args.documents_dir:
         overrides["DOCUMENTS_DIR"] = Path(args.documents_dir).resolve()
+    if getattr(args, "provider", None):
+        overrides["EMBEDDING_PROVIDER"] = args.provider
 
     settings_obj = get_settings(env_override=args.env, **overrides)
     db = DatabaseManager(settings_obj=settings_obj)
-    store = VectorStore(persist_dir=settings_obj.CHROMA_DIR, settings_obj=settings_obj)
+    mgr = EmbeddingManager(settings_obj=settings_obj)
+    store = VectorStore(persist_dir=settings_obj.CHROMA_DIR, settings_obj=settings_obj, embedding_mgr=mgr)
     rag = RAGService(store=store, db=db, settings_obj=settings_obj)
 
     if args.verify_only:

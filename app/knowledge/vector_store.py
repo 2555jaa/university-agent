@@ -71,7 +71,13 @@ class VectorStore:
     ):
         self.settings = settings_obj or settings
         self.persist_dir = persist_dir or self.settings.CHROMA_DIR
-        self.embedding_manager = embedding_mgr or embedding_manager
+        if embedding_mgr is not None:
+            self.embedding_manager = embedding_mgr
+        elif settings_obj is not None:
+            from app.knowledge.embeddings import EmbeddingManager
+            self.embedding_manager = EmbeddingManager(settings_obj=self.settings)
+        else:
+            self.embedding_manager = embedding_manager
         self._chroma_client = None
         self._collection = None
         self._chroma_initialized = False
