@@ -92,3 +92,73 @@ async def test_academic_task_management(memory_db):
     all_tasks = await memory_db.list_tasks()
     assert len(all_tasks) == 1
     assert all_tasks[0]["status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_subject_topic_hierarchy_enforcements(memory_db):
+    """Verify that topics strictly require a valid, existing subject_id and cannot be orphaned."""
+    # 1. Attempting to add topic with empty subject_id raises ValueError
+    with pytest.raises(ValueError, match="Subject ID cannot be empty"):
+        await memory_db.add_or_update_topic("t1", "", "Algorithms")
+
+    # 2. Attempting to add topic with non-existent subject_id raises ValueError
+    with pytest.raises(ValueError, match="does not exist"):
+        await memory_db.add_or_update_topic("t1", "nonexistent_subject", "Algorithms")
+
+    # 3. Attempting to fetch topic by name with non-existent subject_id raises ValueError
+    with pytest.raises(ValueError, match="does not exist"):
+        await memory_db.get_topic_by_name("nonexistent_subject", "Algorithms")
+
+    # 4. Valid subject allows topic creation and retrieval
+    await memory_db.add_subject("cs201", "Data Structures & Algorithms")
+    created_topic = await memory_db.add_or_update_topic("top_algo", "cs201", "Binary Search Trees", mastery=0.6)
+    assert created_topic["subject_id"] == "cs201"
+    assert created_topic["name"] == "Binary Search Trees"
+
+    fetched = await memory_db.get_topic_by_name("cs201", "Binary Search Trees")
+    assert fetched is not None
+    assert fetched["id"] == "top_algo"
+    assert fetched["mastery_level"] == 0.6
+
+    topics_list = await memory_db.list_topics("cs201")
+    assert len(topics_list) == 1
+    assert topics_list[0]["name"] == "Binary Search Trees"
+
+
+@pytest.mark.asyncio
+async def test_save_message_rich_metadata_serialization_and_recent_sessions(memory_db):
+    """Verify save_message serializes/deserializes JSON metadata and get_recent_sessions tracks active sessions."""
+    sess_id = "sess_meta_1"
+    await memory_db.create_session(sess_id, session_type="tutor", title="Machine Learning")
+
+    meta = {
+        "used_sources": [{"filename": "ml_notes.pdf", "page_number": 12}],
+        "reasoning_path": "Step 1: Check gradient descent learning rate.\nStep 2: Calculate cost.",
+        "intent": "TUTORING"
+    }
+
+    # Save message using standard (session_id, role, content, metadata=...) signature
+    saved = await memory_db.save_message(
+        session_id=sess_id,
+        role="assistant",
+        content="Gradient descent updates parameters iteratively.",
+        metadata=meta
+    )
+
+    assert saved["metadata"]["reasoning_path"] == meta["reasoning_path"]
+    assert saved["metadata"]["intent"] == "TUTORING"
+    assert len(saved["metadata"]["used_sources"]) == 1
+
+    # Fetch session history and verify deserialization
+    history = await memory_db.get_session_history(sess_id)
+    assert len(history) == 1
+    msg = history[0]
+    assert isinstance(msg["metadata"], dict)
+    assert msg["metadata"]["reasoning_path"] == meta["reasoning_path"]
+    assert msg["metadata"]["intent"] == "TUTORING"
+    assert msg["citations"] == meta["used_sources"]
+
+    # Verify get_recent_sessions returns session in order
+    recent = await memory_db.get_recent_sessions(limit=5)
+    assert len(recent) >= 1
+    assert any(s["id"] == sess_id for s in recent)

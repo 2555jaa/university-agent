@@ -16,7 +16,13 @@ from app.knowledge.embeddings import (
 from app.knowledge.document_parser import DocumentParser
 from app.knowledge.chunker import AcademicChunker
 from app.knowledge.vector_store import VectorStore
-from app.knowledge.rag_service import RAGService, ContextStatus
+from app.knowledge.rag_service import (
+    RAGService,
+    ContextStatus,
+    CitationValidator,
+    validate_and_format_citations,
+    GroundedContext,
+)
 from app.memory.database import DatabaseManager
 from app.agent.orchestrator import AcademicAgent, AgentQueryRequest
 
@@ -577,5 +583,223 @@ async def test_single_oversized_first_chunk_is_safely_truncated(temp_rag_dir):
     assert "</source>" in ctx.context_text
     assert len(ctx.citations) == 1
     assert rag.estimate_tokens(ctx.context_text) <= 60
+
+
+@pytest.mark.asyncio
+async def test_citation_validator_maps_valid_inline_citations():
+    """Verify that CitationValidator maps valid inline citations [1], [2], [1, 2] to chunk metadata."""
+    from app.knowledge.vector_store import SearchResult
+
+    chunk1 = SearchResult(
+        chunk_id="chunk-os-1",
+        document_id="doc-os",
+        filename="os_virtual_memory.pdf",
+        subject="OS",
+        page_number=4,
+        chunk_index=0,
+        text="Multi-level paging reduces page table memory footprint.",
+        score=0.92,
+        heading="Page Tables"
+    )
+    chunk2 = SearchResult(
+        chunk_id="chunk-os-2",
+        document_id="doc-os",
+        filename="os_virtual_memory.pdf",
+        subject="OS",
+        page_number=5,
+        chunk_index=1,
+        text="The TLB provides high-speed caching for virtual address translations.",
+        score=0.88,
+        heading="TLB Structure"
+    )
+
+    answer_text = (
+        "Virtual memory uses multi-level paging [1]. "
+        "The translation lookaside buffer accelerates translation [2]. "
+        "Combined, they ensure protection [1, 2]."
+    )
+
+    cleaned_text, used_sources = CitationValidator.validate_and_format(answer_text, [chunk1, chunk2])
+
+    assert cleaned_text == answer_text
+    assert len(used_sources) == 2
+    assert used_sources[0]["filename"] == "os_virtual_memory.pdf"
+    assert used_sources[0]["page_number"] == 4
+    assert used_sources[0]["heading"] == "Page Tables"
+    assert used_sources[1]["filename"] == "os_virtual_memory.pdf"
+    assert used_sources[1]["page_number"] == 5
+    assert used_sources[1]["heading"] == "TLB Structure"
+
+
+@pytest.mark.asyncio
+async def test_citation_validator_strips_hallucinated_citations():
+    """Verify that hallucinated citations [99], [42] and orphaned citations are stripped and punctuation is cleaned."""
+    from app.knowledge.vector_store import SearchResult
+
+    chunk1 = SearchResult(
+        chunk_id="chunk-math-1",
+        document_id="doc-math",
+        filename="discrete_math.txt",
+        subject="Math",
+        page_number=1,
+        chunk_index=0,
+        text="Propositional logic uses truth tables to prove tautologies.",
+        score=0.91,
+        heading="Propositional Logic"
+    )
+
+    answer_text = (
+        "Propositional logic uses truth tables [1]. "
+        "Quantum entanglement invalidates classical logic [99]. "
+        "Neural architectures bypass formal proofs [42] . "
+        "Finally, first-order logic extends predicates [1, 99]."
+    )
+
+    cleaned_text, used_sources = validate_and_format_citations(answer_text, [chunk1])
+
+    # Hallucinations stripped
+    assert "[99]" not in cleaned_text
+    assert "[42]" not in cleaned_text
+    # Valid citations preserved
+    assert "[1]" in cleaned_text
+    assert "Propositional logic uses truth tables [1]." in cleaned_text
+    assert "extends predicates [1]." in cleaned_text
+    # Punctuation cleaned without dangling whitespace
+    assert "bypass formal proofs." in cleaned_text
+    assert " [42] ." not in cleaned_text
+    assert len(used_sources) == 1
+    assert used_sources[0]["filename"] == "discrete_math.txt"
+
+
+@pytest.mark.asyncio
+async def test_citation_validator_deduplicates_used_sources():
+    """Verify that multiple inline references to the same source produce a single deduplicated entry in used_sources."""
+    from app.knowledge.vector_store import SearchResult
+
+    chunk1 = SearchResult(
+        chunk_id="gov-1",
+        document_id="doc-gov",
+        filename="ai_governance.docx",
+        subject="Ethics",
+        page_number=2,
+        chunk_index=0,
+        text="The EU AI Act establishes risk-based tiers for systems.",
+        score=0.95,
+        heading="EU AI Act"
+    )
+    chunk2 = SearchResult(
+        chunk_id="gov-2",
+        document_id="doc-gov",
+        filename="ai_governance.docx",
+        subject="Ethics",
+        page_number=8,
+        chunk_index=1,
+        text="High-risk AI systems require mandatory conformity assessments.",
+        score=0.87,
+        heading="High Risk Systems"
+    )
+
+    answer_text = (
+        "The AI Act establishes risk categories [1]. "
+        "High-risk systems require audits [2]. "
+        "Transparency is also mandated under the Act [1]. "
+        "Enforcement is strictly supervised by national authorities [1]."
+    )
+
+    cleaned_text, used_sources = CitationValidator.validate_and_format(answer_text, [chunk1, chunk2])
+
+    # [1] appears 3 times in text, [2] appears once
+    assert cleaned_text.count("[1]") == 3
+    assert cleaned_text.count("[2]") == 1
+    # used_sources contains each source exactly once, ordered by first appearance
+    assert len(used_sources) == 2
+    assert used_sources[0]["chunk_id"] == "gov-1"
+    assert used_sources[1]["chunk_id"] == "gov-2"
+
+
+@pytest.mark.asyncio
+async def test_academic_agent_end_to_end_citation_validation(temp_rag_dir):
+    """Verify AcademicAgent end-to-end strips hallucinated citations from LLM reply and accurately populates used_sources."""
+    from app.config import Settings
+    from app.providers.base import LLMResponse
+    from app.knowledge.vector_store import SearchResult
+
+    test_settings = Settings(
+        APP_ENV="testing",
+        DATA_DIR=temp_rag_dir,
+        SQLITE_PATH=temp_rag_dir / "test.db",
+        CHROMA_DIR=temp_rag_dir / "chroma",
+        DOCUMENTS_DIR=temp_rag_dir / "docs"
+    )
+    db = DatabaseManager(settings_obj=test_settings)
+    await db.init_db()
+    store = VectorStore(persist_dir=test_settings.CHROMA_DIR, settings_obj=test_settings)
+    rag = RAGService(store=store, db=db, settings_obj=test_settings)
+    agent = AcademicAgent(rag_instance=rag, db_instance=db, settings_obj=test_settings)
+
+    mock_chunks = [
+        SearchResult(
+            chunk_id="phys-1",
+            document_id="doc-phys",
+            filename="physics_constants.pdf",
+            subject="Physics",
+            page_number=1,
+            chunk_index=0,
+            text="The speed of light c in vacuum is exactly 299,792,458 m/s.",
+            score=0.94,
+            heading="Physical Constants"
+        ),
+        SearchResult(
+            chunk_id="os-1",
+            document_id="doc-os",
+            filename="os_virtual_memory.pdf",
+            subject="OS",
+            page_number=3,
+            chunk_index=0,
+            text="Operating systems handle hardware interrupts through interrupt vectors.",
+            score=0.85,
+            heading="Interrupts"
+        )
+    ]
+
+    with patch.object(rag.store, "search", AsyncMock(return_value=mock_chunks)):
+        mock_model_reply = (
+            "The speed of light is constant in vacuum [1]. "
+            "String theory unifies gravity at Planck scale [99]. "
+            "Operating systems manage interrupts via hardware vectors [2]."
+        )
+        with patch.object(agent.router, "route_and_generate") as mock_route:
+            mock_route.return_value = LLMResponse(
+                content=mock_model_reply,
+                model="llama3:latest",
+                provider="ollama"
+            )
+
+            req = AgentQueryRequest(message="Tell me about light and interrupts", use_rag=True)
+            res = await agent.process_query(req)
+
+            # Hallucinated citation [99] stripped from reply
+            assert "[99]" not in res.reply
+            assert "[1]" in res.reply
+            assert "[2]" in res.reply
+            assert "unifies gravity at Planck scale." in res.reply
+
+            # used_sources contains only chunks 1 and 2
+            assert len(res.used_sources) == 2
+            assert res.used_sources[0]["filename"] == "physics_constants.pdf"
+            assert res.used_sources[1]["filename"] == "os_virtual_memory.pdf"
+            assert res.citations == res.used_sources
+            assert res.has_grounding is True
+
+            # Verify SQLite session persistence stored the validated used_sources
+            history = await db.get_session_history(res.session_id)
+            assistant_entry = next(h for h in history if h["role"] == "assistant")
+            assert assistant_entry["content"] == res.reply
+            stored_citations = assistant_entry["citations"]
+            if isinstance(stored_citations, str):
+                stored_citations = json.loads(stored_citations)
+            assert len(stored_citations) == 2
+            assert stored_citations[0]["filename"] == "physics_constants.pdf"
+
 
 

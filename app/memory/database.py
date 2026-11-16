@@ -102,6 +102,7 @@ def _migration_001_initial_schema(conn: sqlite3.Connection) -> None:
         content TEXT NOT NULL,
         mode TEXT DEFAULT 'general',
         citations TEXT,
+        metadata TEXT,
         timestamp TEXT NOT NULL,
         FOREIGN KEY(session_id) REFERENCES learning_sessions(id) ON DELETE CASCADE
     );
@@ -168,7 +169,9 @@ def _migration_002_constraints_and_indexes(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_subject_updated ON learning_sessions(subject_id, updated_at);")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_started_at ON learning_sessions(started_at);")
 
-    # 4. messages: role domain check and composite index (session_id, timestamp)
+    # 4. messages: role domain check, metadata column, and composite index (session_id, timestamp)
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(messages)").fetchall()]
+    has_meta = "metadata" in cols
     conn.execute("""
     CREATE TABLE messages_new (
         id TEXT PRIMARY KEY,
@@ -177,11 +180,15 @@ def _migration_002_constraints_and_indexes(conn: sqlite3.Connection) -> None:
         content TEXT NOT NULL,
         mode TEXT DEFAULT 'general',
         citations TEXT,
+        metadata TEXT,
         timestamp TEXT NOT NULL,
         FOREIGN KEY(session_id) REFERENCES learning_sessions(id) ON DELETE CASCADE
     );
     """)
-    conn.execute("INSERT INTO messages_new SELECT id, session_id, role, content, mode, citations, timestamp FROM messages;")
+    if has_meta:
+        conn.execute("INSERT INTO messages_new SELECT id, session_id, role, content, mode, citations, metadata, timestamp FROM messages;")
+    else:
+        conn.execute("INSERT INTO messages_new SELECT id, session_id, role, content, mode, citations, NULL AS metadata, timestamp FROM messages;")
     conn.execute("DROP TABLE messages;")
     conn.execute("ALTER TABLE messages_new RENAME TO messages;")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_session_time ON messages(session_id, timestamp);")
@@ -776,9 +783,9 @@ class DatabaseManager:
         mastery: float = 0.0,
         notes: str = ""
     ) -> Dict[str, Any]:
-        cleaned_id = topic_id.strip()
-        cleaned_sub = subject_id.strip()
-        cleaned_name = name.strip()
+        cleaned_id = topic_id.strip() if topic_id else ""
+        cleaned_sub = subject_id.strip() if subject_id else ""
+        cleaned_name = name.strip() if name else ""
         if not cleaned_id:
             raise ValueError("Topic ID cannot be empty.")
         if not cleaned_sub:
@@ -790,27 +797,82 @@ class DatabaseManager:
 
         now = datetime.now(timezone.utc).isoformat()
         async with self.transaction() as conn:
+            # Ensure topic strictly belongs to a valid existing subject
+            sub_cur = await conn.execute(
+                "SELECT id FROM subjects WHERE id = ? OR LOWER(id) = LOWER(?)",
+                (cleaned_sub, cleaned_sub)
+            )
+            subj = await sub_cur.fetchone()
+            if not subj:
+                raise ValueError(f"Subject '{cleaned_sub}' does not exist.")
+
+            resolved_sub_id = subj[0]
             await conn.execute(
                 """
                 INSERT INTO topics (id, subject_id, name, mastery_level, notes, updated_at)
                 VALUES (?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
+                    subject_id = excluded.subject_id,
+                    name = excluded.name,
                     mastery_level = excluded.mastery_level,
                     notes = excluded.notes,
                     updated_at = excluded.updated_at
                 """,
-                (cleaned_id, cleaned_sub, cleaned_name, mastery, notes, now)
+                (cleaned_id, resolved_sub_id, cleaned_name, mastery, notes, now)
             )
-            return {"id": cleaned_id, "subject_id": cleaned_sub, "name": cleaned_name, "mastery_level": mastery, "notes": notes, "updated_at": now}
+            return {
+                "id": cleaned_id,
+                "subject_id": resolved_sub_id,
+                "name": cleaned_name,
+                "mastery_level": mastery,
+                "notes": notes,
+                "updated_at": now
+            }
+
+    async def get_topic_by_name(self, subject_id: str, topic_name: str) -> Optional[Dict[str, Any]]:
+        """Fetch a topic by its name under a specific subject_id."""
+        cleaned_sub = subject_id.strip() if subject_id else ""
+        cleaned_name = topic_name.strip() if topic_name else ""
+        if not cleaned_sub:
+            raise ValueError("Subject ID cannot be empty.")
+        if not cleaned_name:
+            raise ValueError("Topic name cannot be empty.")
+
+        async with self.get_connection() as conn:
+            # Check subject exists
+            sub_cur = await conn.execute(
+                "SELECT id FROM subjects WHERE id = ? OR LOWER(id) = LOWER(?)",
+                (cleaned_sub, cleaned_sub)
+            )
+            subj = await sub_cur.fetchone()
+            if not subj:
+                raise ValueError(f"Subject '{cleaned_sub}' does not exist.")
+
+            cursor = await conn.execute(
+                "SELECT * FROM topics WHERE subject_id = ? AND LOWER(name) = LOWER(?)",
+                (subj[0], cleaned_name)
+            )
+            row = await cursor.fetchone()
+            return dict(row) if row else None
 
     async def list_topics(self, subject_id: Optional[str] = None) -> List[Dict[str, Any]]:
-        async with self.get_connection() as conn:
-            if subject_id:
-                cursor = await conn.execute("SELECT * FROM topics WHERE subject_id = ? ORDER BY name ASC", (subject_id.strip(),))
-            else:
+        """List topics, optionally filtered by subject_id."""
+        if subject_id is not None:
+            cleaned_sub = subject_id.strip()
+            if not cleaned_sub:
+                raise ValueError("Subject ID cannot be empty.")
+            async with self.get_connection() as conn:
+                cursor = await conn.execute(
+                    "SELECT * FROM topics WHERE subject_id = ? OR LOWER(subject_id) = LOWER(?) ORDER BY name ASC",
+                    (cleaned_sub, cleaned_sub)
+                )
+                rows = await cursor.fetchall()
+                return [dict(r) for r in rows]
+        else:
+            async with self.get_connection() as conn:
                 cursor = await conn.execute("SELECT * FROM topics ORDER BY name ASC")
-            rows = await cursor.fetchall()
-            return [dict(r) for r in rows]
+                rows = await cursor.fetchall()
+                return [dict(r) for r in rows]
 
     # --- SESSIONS & CONVERSATION ---
 
@@ -844,19 +906,75 @@ class DatabaseManager:
             )
             return {"id": cleaned_id, "session_type": cleaned_type, "title": title.strip(), "started_at": now, "subject_id": subject_id}
 
+    async def get_recent_sessions(self, limit: int = 5) -> List[Dict[str, Any]]:
+        """Retrieve recent learning sessions ordered by latest activity."""
+        safe_limit = max(1, limit)
+        async with self.get_connection() as conn:
+            cursor = await conn.execute(
+                """
+                SELECT id, session_type, title, started_at, ended_at, summary, subject_id, updated_at
+                FROM learning_sessions
+                ORDER BY COALESCE(updated_at, started_at) DESC
+                LIMIT ?
+                """,
+                (safe_limit,)
+            )
+            rows = await cursor.fetchall()
+            return [dict(r) for r in rows]
+
+    async def _has_messages_metadata_column(self, conn: Any) -> bool:
+        cursor = await conn.execute("PRAGMA table_info(messages)")
+        rows = await cursor.fetchall()
+        cols = [r[1] for r in rows]
+        return "metadata" in cols
+
     async def save_message(
         self,
-        message_id: str,
-        session_id: str,
-        role: str,
-        content: str,
+        arg1: Optional[str] = None,
+        arg2: Optional[str] = None,
+        arg3: Optional[str] = None,
+        arg4: Optional[Any] = None,
         mode: str = "general",
-        citations: Optional[List[Dict[str, Any]]] = None
+        citations: Optional[List[Dict[str, Any]]] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        message_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+        role: Optional[str] = None,
+        content: Optional[str] = None,
+        **kwargs: Any
     ) -> Dict[str, Any]:
-        cleaned_id = message_id.strip()
-        cleaned_sess = session_id.strip()
-        cleaned_role = role.strip().lower()
-        cleaned_content = content.strip()
+        """Save a message with session association, mode, citations, and rich JSON metadata.
+
+        Supports both standard signatures:
+        1. save_message(session_id, role, content, metadata=None)
+        2. save_message(message_id, session_id, role, content, mode, citations, metadata)
+        3. keyword arguments: save_message(session_id=..., role=..., content=..., metadata=...)
+        """
+        import uuid as _uuid
+
+        if session_id is not None:
+            cleaned_id = str(message_id or arg1 or _uuid.uuid4()).strip()
+            cleaned_sess = str(session_id).strip()
+            cleaned_role = str(role or arg2 or "").strip().lower()
+            cleaned_content = str(content if content is not None else (arg3 if arg3 is not None else "")).strip()
+        elif arg2 is not None and str(arg2).strip().lower() in ("user", "assistant", "system"):
+            # Signature: save_message(session_id, role, content, metadata=None)
+            cleaned_id = str(message_id or _uuid.uuid4()).strip()
+            cleaned_sess = str(arg1 or "").strip()
+            cleaned_role = str(arg2).strip().lower()
+            cleaned_content = str(arg3 if arg3 is not None else "").strip()
+            if isinstance(arg4, dict) and metadata is None:
+                metadata = arg4
+        else:
+            # Signature: save_message(message_id, session_id, role, content, ...)
+            cleaned_id = str(arg1 or message_id or _uuid.uuid4()).strip()
+            cleaned_sess = str(arg2 or "").strip()
+            cleaned_role = str(arg3 or role or "").strip().lower()
+            cleaned_content = str(arg4 if arg4 is not None else (content or "")).strip()
+            cleaned_sess = (arg2 or "").strip()
+            cleaned_role = (arg3 or "").strip().lower()
+            cleaned_content = str(arg4 or "").strip()
+
         if not cleaned_id:
             raise ValueError("Message ID cannot be empty.")
         if not cleaned_sess:
@@ -864,24 +982,69 @@ class DatabaseManager:
         if not cleaned_content:
             raise ValueError("Message content cannot be empty.")
         if cleaned_role not in ("user", "assistant", "system"):
-            raise ValueError(f"Invalid message role '{role}'.")
+            raise ValueError(f"Invalid message role '{cleaned_role}'.")
+
+        # Synchronize citations and metadata
+        if metadata is not None and not citations:
+            if "used_sources" in metadata and isinstance(metadata["used_sources"], list):
+                citations = metadata["used_sources"]
+            elif "citations" in metadata and isinstance(metadata["citations"], list):
+                citations = metadata["citations"]
+        elif citations is not None and metadata is None:
+            metadata = {"used_sources": citations}
+        elif citations is not None and metadata is not None:
+            if "used_sources" not in metadata:
+                metadata["used_sources"] = citations
 
         now = datetime.now(timezone.utc).isoformat()
         citations_json = json.dumps(citations or [])
+        metadata_json = json.dumps(metadata or {})
+
         async with self.transaction() as conn:
+            has_meta = await self._has_messages_metadata_column(conn)
+            if not has_meta:
+                try:
+                    await conn.execute("ALTER TABLE messages ADD COLUMN metadata TEXT;")
+                    has_meta = True
+                except Exception:
+                    has_meta = False
+
+            if has_meta:
+                await conn.execute(
+                    """
+                    INSERT INTO messages (id, session_id, role, content, mode, citations, metadata, timestamp)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(id) DO UPDATE SET
+                        role = excluded.role,
+                        content = excluded.content,
+                        mode = excluded.mode,
+                        citations = excluded.citations,
+                        metadata = excluded.metadata,
+                        timestamp = excluded.timestamp
+                    """,
+                    (cleaned_id, cleaned_sess, cleaned_role, cleaned_content, mode, citations_json, metadata_json, now)
+                )
+            else:
+                await conn.execute(
+                    """
+                    INSERT INTO messages (id, session_id, role, content, mode, citations, timestamp)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(id) DO UPDATE SET
+                        role = excluded.role,
+                        content = excluded.content,
+                        mode = excluded.mode,
+                        citations = excluded.citations,
+                        timestamp = excluded.timestamp
+                    """,
+                    (cleaned_id, cleaned_sess, cleaned_role, cleaned_content, mode, citations_json, now)
+                )
+
+            # Update session's updated_at timestamp
             await conn.execute(
-                """
-                INSERT INTO messages (id, session_id, role, content, mode, citations, timestamp)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(id) DO UPDATE SET
-                    role = excluded.role,
-                    content = excluded.content,
-                    mode = excluded.mode,
-                    citations = excluded.citations,
-                    timestamp = excluded.timestamp
-                """,
-                (cleaned_id, cleaned_sess, cleaned_role, cleaned_content, mode, citations_json, now)
+                "UPDATE learning_sessions SET updated_at = ? WHERE id = ?",
+                (now, cleaned_sess)
             )
+
             return {
                 "id": cleaned_id,
                 "session_id": cleaned_sess,
@@ -889,6 +1052,7 @@ class DatabaseManager:
                 "content": cleaned_content,
                 "mode": mode,
                 "citations": citations or [],
+                "metadata": metadata or {},
                 "timestamp": now
             }
 
@@ -907,6 +1071,17 @@ class DatabaseManager:
                         item["citations"] = json.loads(item["citations"])
                     except Exception:
                         item["citations"] = []
+                else:
+                    item["citations"] = []
+
+                if item.get("metadata"):
+                    try:
+                        item["metadata"] = json.loads(item["metadata"])
+                    except Exception:
+                        item["metadata"] = {}
+                else:
+                    item["metadata"] = {"used_sources": item["citations"]} if item["citations"] else {}
+
                 result.append(item)
             return result
 

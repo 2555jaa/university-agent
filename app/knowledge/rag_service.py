@@ -7,7 +7,7 @@ import html
 import logging
 from pathlib import Path
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple, Union
 import uuid
 from pydantic import BaseModel, Field
 
@@ -50,6 +50,165 @@ class GroundedContext(BaseModel):
     has_relevant_info: bool = False
     status: ContextStatus = ContextStatus.NO_DOCUMENTS
     threshold_applied: Optional[float] = None
+
+
+class CitationValidator:
+    """Validates inline numeric citations against retrieved document context,
+
+    strips hallucinatory or orphaned citations, and extracts genuine source attribution.
+    """
+
+    CITATION_PATTERN = re.compile(r'(\s*)\[(\d+(?:\s*,\s*\d+)*)\](?!\()')
+    CODE_PATTERN = re.compile(r'(```[\s\S]*?```|`[^`\n]+`)')
+
+    @classmethod
+    def _extract_source_map(
+        cls,
+        retrieved_chunks: Union[List[Any], GroundedContext]
+    ) -> Dict[int, Dict[str, Any]]:
+        """Extract a lookup map of index -> source metadata from chunks or GroundedContext."""
+        if isinstance(retrieved_chunks, GroundedContext):
+            raw_list = retrieved_chunks.citations
+        elif isinstance(retrieved_chunks, list):
+            raw_list = retrieved_chunks
+        elif hasattr(retrieved_chunks, "citations") and isinstance(retrieved_chunks.citations, list):
+            raw_list = retrieved_chunks.citations
+        else:
+            raw_list = []
+
+        source_map: Dict[int, Dict[str, Any]] = {}
+
+        for i, item in enumerate(raw_list, 1):
+            if isinstance(item, dict):
+                raw_idx = item.get("index", i)
+                chunk_id = item.get("chunk_id", f"chunk-{i}")
+                doc_id = item.get("document_id") or item.get("doc_id") or item.get("filename") or str(chunk_id)
+                meta = {
+                    "index": int(raw_idx) if isinstance(raw_idx, (int, str)) and str(raw_idx).isdigit() else i,
+                    "chunk_id": chunk_id,
+                    "document_id": doc_id,
+                    "filename": item.get("filename", "unknown"),
+                    "page_number": item.get("page_number", 1),
+                    "heading": item.get("heading", ""),
+                    "subject": item.get("subject"),
+                    "score": item.get("score"),
+                    "semantic_score": item.get("semantic_score"),
+                    "lexical_score": item.get("lexical_score"),
+                    "snippet": item.get("snippet", item.get("text", "")[:200] if isinstance(item.get("text"), str) else "")
+                }
+            else:
+                raw_idx = getattr(item, "index", i)
+                chunk_id = getattr(item, "chunk_id", f"chunk-{i}")
+                doc_id = getattr(item, "document_id", getattr(item, "filename", str(chunk_id)))
+                meta = {
+                    "index": int(raw_idx) if isinstance(raw_idx, (int, str)) and str(raw_idx).isdigit() else i,
+                    "chunk_id": chunk_id,
+                    "document_id": doc_id,
+                    "filename": getattr(item, "filename", "unknown"),
+                    "page_number": getattr(item, "page_number", 1),
+                    "heading": getattr(item, "heading", ""),
+                    "subject": getattr(item, "subject", None),
+                    "score": getattr(item, "score", None),
+                    "semantic_score": getattr(item, "semantic_score", None),
+                    "lexical_score": getattr(item, "lexical_score", None),
+                    "snippet": getattr(item, "text", "")[:200] if hasattr(item, "text") and isinstance(item.text, str) else ""
+                }
+
+            # Map 1-based sequential index
+            source_map[i] = meta
+            # Map index if specified
+            if isinstance(raw_idx, int):
+                source_map[raw_idx] = meta
+            elif isinstance(raw_idx, str) and raw_idx.isdigit():
+                source_map[int(raw_idx)] = meta
+
+            # Map numeric chunk_id if it parses as integer
+            if isinstance(chunk_id, int):
+                source_map[chunk_id] = meta
+            elif isinstance(chunk_id, str) and chunk_id.isdigit():
+                source_map[int(chunk_id)] = meta
+
+        return source_map
+
+    @classmethod
+    def validate_and_format(
+        cls,
+        answer_text: str,
+        retrieved_chunks: Union[List[Any], GroundedContext]
+    ) -> Tuple[str, List[Dict[str, Any]]]:
+        """Parse answer_text, validate inline numeric citations, strip hallucinations, and return (cleaned_text, used_sources)."""
+        if not answer_text:
+            return "", []
+
+        source_map = cls._extract_source_map(retrieved_chunks)
+        used_source_ids: List[int] = []
+
+        # Mask code blocks and inline code to prevent false positives in code snippets
+        code_blocks: List[str] = []
+
+        def _mask_code(match: re.Match) -> str:
+            idx = len(code_blocks)
+            code_blocks.append(match.group(0))
+            return f"\x00CODE_{idx}\x00"
+
+        masked_text = cls.CODE_PATTERN.sub(_mask_code, answer_text)
+
+        def _replace_citation(match: re.Match) -> str:
+            whitespace = match.group(1)
+            raw_ids = match.group(2)
+            id_tokens = [int(num.strip()) for num in raw_ids.split(",") if num.strip().isdigit()]
+
+            valid_ids_in_bracket: List[int] = []
+            for num_id in id_tokens:
+                if num_id in source_map:
+                    valid_ids_in_bracket.append(num_id)
+                    used_source_ids.append(num_id)
+
+            if not valid_ids_in_bracket:
+                return ""
+
+            formatted_ids = ", ".join(str(i) for i in valid_ids_in_bracket)
+            return f"{whitespace}[{formatted_ids}]"
+
+        cleaned = cls.CITATION_PATTERN.sub(_replace_citation, masked_text)
+
+        # Formatting cleanup:
+        # 1. Whitespace before punctuation (e.g. "paging ." -> "paging.")
+        cleaned = re.sub(r'[ \t]+([.,;:!?])', r'\1', cleaned)
+        # 2. Add space if a citation is right up against a preceding word ("word[1]" -> "word [1]")
+        cleaned = re.sub(r'(\w)\[(\d+)', r'\1 [\2', cleaned)
+        # 3. Collapse multiple horizontal spaces
+        cleaned = re.sub(r'[ \t]{2,}', ' ', cleaned)
+        # 4. Strip trailing spaces per line and line-initial spaces from stripped citations
+        lines = []
+        for line in cleaned.splitlines():
+            stripped_line = line.rstrip()
+            if stripped_line.startswith(" ") and not stripped_line.startswith("    "):
+                stripped_line = stripped_line.lstrip()
+            lines.append(stripped_line)
+        cleaned = "\n".join(lines).strip()
+
+        # Restore code blocks
+        for idx, block in enumerate(code_blocks):
+            cleaned = cleaned.replace(f"\x00CODE_{idx}\x00", block)
+
+        # Deduplicate used sources preserving first appearance order
+        seen_keys = set()
+        used_sources: List[Dict[str, Any]] = []
+        for src_id in used_source_ids:
+            if src_id in source_map:
+                src = source_map[src_id]
+                key = src.get("chunk_id") or (
+                    src.get("filename"),
+                    src.get("page_number"),
+                    src.get("heading"),
+                    src.get("index")
+                )
+                if key not in seen_keys:
+                    seen_keys.add(key)
+                    used_sources.append(src)
+
+        return cleaned, used_sources
 
 
 class RAGService:
@@ -746,6 +905,22 @@ class RAGService:
     async def reindex_all_documents(self, force: bool = False) -> Dict[str, Any]:
         """Backward-compatible alias for reindex_all."""
         return await self.reindex_all(force_re_embed=force)
+
+    def validate_and_format_citations(
+        self,
+        answer_text: str,
+        retrieved_chunks: Union[List[Any], GroundedContext]
+    ) -> Tuple[str, List[Dict[str, Any]]]:
+        """Validate inline citations against retrieved context and return cleaned text and used sources."""
+        return CitationValidator.validate_and_format(answer_text, retrieved_chunks)
+
+
+def validate_and_format_citations(
+    answer_text: str,
+    retrieved_chunks: Union[List[Any], GroundedContext]
+) -> Tuple[str, List[Dict[str, Any]]]:
+    """Module-level function to validate inline citations and return cleaned text and used sources."""
+    return CitationValidator.validate_and_format(answer_text, retrieved_chunks)
 
 
 rag_service = RAGService()
