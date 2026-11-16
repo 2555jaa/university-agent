@@ -34,7 +34,7 @@ async def health_check(request: Request):
     s = services.settings
     ollama_ok = await OllamaProvider(settings_obj=s).is_available()
     cloud_ok = await CloudAIProvider(settings_obj=s).is_available()
-    emb_info = await services.embedding_manager.get_active_info()
+    emb_health = await services.embedding_manager.check_health()
     db_health = await services.db.check_health()
     vec_status = services.vector_store.get_index_status()
 
@@ -55,10 +55,12 @@ async def health_check(request: Request):
             "total_chunks": vec_status.get("total_chunks", 0),
         },
         "embeddings": {
-            "provider": emb_info.provider,
-            "model": emb_info.model,
-            "is_neural": emb_info.is_neural,
-            "dimension": emb_info.dimension,
+            "status": emb_health.get("status", "unknown"),
+            "provider": emb_health.get("provider", "unknown"),
+            "model": emb_health.get("model", "unknown"),
+            "is_neural": emb_health.get("is_neural", False),
+            "dimension": emb_health.get("dimension", 0),
+            "error": emb_health.get("error"),
         },
         "llm_providers": {
             "ollama": {
@@ -76,10 +78,11 @@ async def health_check(request: Request):
         "ollama_available": ollama_ok,
         "cloud_available": cloud_ok,
         "local_model": s.LOCAL_MODEL,
-        "embedding_provider": emb_info.provider,
-        "embedding_model": emb_info.model,
-        "embedding_is_neural": emb_info.is_neural,
-        "embedding_dimension": emb_info.dimension,
+        "embedding_provider": emb_health.get("provider", "unknown"),
+        "embedding_model": emb_health.get("model", "unknown"),
+        "embedding_is_neural": emb_health.get("is_neural", False),
+        "embedding_dimension": emb_health.get("dimension", 0),
+        "embedding_status": emb_health.get("status", "unknown"),
     }
 
 

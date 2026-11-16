@@ -14,7 +14,7 @@ from app.agent.prompts import (
     ASSIGNMENT_PLANNER_SYSTEM_PROMPT,
     GENERAL_ASSISTANT_SYSTEM_PROMPT,
 )
-from app.knowledge.rag_service import rag_service, GroundedContext
+from app.knowledge.rag_service import rag_service, GroundedContext, ContextStatus
 from app.memory.database import db
 from app.providers.base import LLMMessage, LLMResponse
 from app.providers.router import router, TaskComplexity
@@ -115,6 +115,13 @@ class AcademicAgent:
                 "If the retrieved context does not directly answer the user's specific question, clearly state: "
                 "'The provided academic materials do not contain sufficient evidence to answer this question' "
                 "and NEVER fabricate page numbers or citations."
+            )
+        elif req.use_rag and grounded_ctx.status == ContextStatus.INSUFFICIENT_EVIDENCE:
+            system_prompt += (
+                "\n\n<retrieved_context_status>\n"
+                "INSUFFICIENT_EVIDENCE: No authorized course documents matched this query above the similarity threshold.\n"
+                "State clearly: \"I don't have enough information in your notes to answer this.\" Do not hallucinate course details.\n"
+                "</retrieved_context_status>\n"
             )
 
         messages: List[LLMMessage] = [LLMMessage(role="system", content=system_prompt)]

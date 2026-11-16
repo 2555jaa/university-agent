@@ -46,6 +46,7 @@ class Settings(BaseSettings):
     LOCAL_FALLBACK_MODEL: str = "qwen2.5:0.5b"
     EMBEDDING_MODEL: str = "nomic-embed-text"
     EMBEDDING_PROVIDER: Literal["auto", "ollama", "deterministic_hash"] = "auto"
+    ALLOW_FALLBACK_EMBEDDINGS: bool = False
 
     RAG_SIMILARITY_THRESHOLD: float = 0.45
     RAG_MIN_SEMANTIC_ONLY_SCORE: float = 0.50

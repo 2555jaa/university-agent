@@ -16,7 +16,8 @@ from app.knowledge.embeddings import (
 from app.knowledge.document_parser import DocumentParser
 from app.knowledge.chunker import AcademicChunker
 from app.knowledge.vector_store import VectorStore
-from app.knowledge.rag_service import RAGService
+from app.knowledge.rag_service import RAGService, ContextStatus
+from app.memory.database import DatabaseManager
 from app.agent.orchestrator import AcademicAgent, AgentQueryRequest
 
 
@@ -241,3 +242,136 @@ async def test_retrieval_scoring_semantics_and_anisotropy_remediation(temp_rag_d
     assert 0.0 <= relevant_res[0].score <= 1.0
     assert 0.0 <= relevant_res[0].semantic_score <= 1.0
     assert 0.0 <= relevant_res[0].lexical_score <= 1.0
+
+
+@pytest.mark.asyncio
+async def test_rag_service_insufficient_evidence_when_below_threshold(temp_rag_dir):
+    """Verify that when retrieved chunks fail to meet relevance thresholds, RAGService returns INSUFFICIENT_EVIDENCE."""
+    from app.config import Settings
+    test_settings = Settings(
+        APP_ENV="testing",
+        DATA_DIR=temp_rag_dir,
+        SQLITE_PATH=temp_rag_dir / "test.db",
+        CHROMA_DIR=temp_rag_dir / "chroma",
+        DOCUMENTS_DIR=temp_rag_dir / "docs",
+        RAG_SIMILARITY_THRESHOLD=0.50
+    )
+    db = DatabaseManager(settings_obj=test_settings)
+    store = VectorStore(persist_dir=test_settings.CHROMA_DIR, settings_obj=test_settings)
+    rag = RAGService(store=store, db=db, settings_obj=test_settings)
+
+    # 1. Zero documents in index -> NO_DOCUMENTS status
+    ctx_empty = await rag.retrieve_grounded_context("What is discrete mathematics?")
+    assert ctx_empty.has_relevant_info is False
+    assert ctx_empty.status == ContextStatus.NO_DOCUMENTS
+    assert "No academic documents are indexed" in ctx_empty.context_text
+
+    # 2. Ingest document
+    doc_path = test_settings.DOCUMENTS_DIR / "discrete_math.txt"
+    test_settings.DOCUMENTS_DIR.mkdir(parents=True, exist_ok=True)
+    doc_path.write_text("Discrete Mathematics: Predicate logic and truth tables form formal proofs.")
+    await rag.ingest_document(doc_path, subject="Mathematics")
+
+    # 3. Query with completely unrelated topic and high threshold -> INSUFFICIENT_EVIDENCE
+    ctx_unrelated = await rag.retrieve_grounded_context(
+        "biochemical ATP synthesis and cellular respiration",
+        score_threshold=0.85
+    )
+    assert ctx_unrelated.has_relevant_info is False
+    assert ctx_unrelated.status == ContextStatus.INSUFFICIENT_EVIDENCE
+    assert "I don't have enough information in your notes to answer this" in ctx_unrelated.context_text
+    assert len(ctx_unrelated.citations) == 0
+
+    # 4. Relevant query passes threshold -> FOUND
+    ctx_relevant = await rag.retrieve_grounded_context("Predicate logic and formal proofs", score_threshold=0.20)
+    assert ctx_relevant.has_relevant_info is True
+    assert ctx_relevant.status == ContextStatus.FOUND
+    assert len(ctx_relevant.citations) >= 1
+    assert ctx_relevant.citations[0]["filename"] == "discrete_math.txt"
+
+
+@pytest.mark.asyncio
+async def test_rag_service_reindex_all_rebuilds_chromadb_and_handles_missing_files(temp_rag_dir):
+    """Verify that reindex_all rebuilds ChromaDB collection from catalog and flags missing files as failed."""
+    from app.config import Settings
+    test_settings = Settings(
+        APP_ENV="testing",
+        DATA_DIR=temp_rag_dir,
+        SQLITE_PATH=temp_rag_dir / "test.db",
+        CHROMA_DIR=temp_rag_dir / "chroma",
+        DOCUMENTS_DIR=temp_rag_dir / "docs"
+    )
+    test_settings.DOCUMENTS_DIR.mkdir(parents=True, exist_ok=True)
+    db = DatabaseManager(settings_obj=test_settings)
+    store = VectorStore(persist_dir=test_settings.CHROMA_DIR, settings_obj=test_settings)
+    rag = RAGService(store=store, db=db, settings_obj=test_settings)
+
+    # Ingest two physical documents
+    file1 = test_settings.DOCUMENTS_DIR / "operating_systems.txt"
+    file1.write_text("Operating Systems: Virtual memory paging and page replacement algorithms.")
+    file2 = test_settings.DOCUMENTS_DIR / "networks.txt"
+    file2.write_text("Computer Networks: Transmission Control Protocol three-way handshake.")
+
+    res1 = await rag.ingest_document(file1, subject="OS")
+    res2 = await rag.ingest_document(file2, subject="Networks")
+    assert res1.status == "success"
+    assert res2.status == "success"
+    assert store.collection.count() >= 2
+
+    # Verify both are cataloged as indexed
+    cat_before = await db.list_documents()
+    assert len(cat_before) == 2
+    assert all(d["status"] == "indexed" for d in cat_before)
+
+    # Simulate missing physical file: delete networks.txt from disk
+    file2.unlink()
+    assert not file2.exists()
+
+    # Run reindex_all
+    reindex_report = await rag.reindex_all(force_re_embed=True)
+    assert reindex_report["ok"] is True
+    assert reindex_report["total_catalog_documents"] == 2
+    assert reindex_report["reindexed"] == 1
+    assert reindex_report["missing"] == 1
+
+    # Verify SQLite catalog state
+    cat_after = {d["filename"]: d for d in await db.list_documents()}
+    assert cat_after["operating_systems.txt"]["status"] == "indexed"
+    assert cat_after["networks.txt"]["status"] == "failed"
+    assert cat_after["networks.txt"]["error_message"] == "File missing on disk"
+
+    # Verify ChromaDB collection was rebuilt and only contains the existing document
+    assert store.collection.count() == 1
+    chroma_data = store.collection.get()
+    assert all(m["filename"] == "operating_systems.txt" for m in chroma_data["metadatas"])
+
+
+def test_cli_script_reindex_database_execution(tmp_path):
+    """Verify scripts/reindex_database.py runs via CLI and produces structured report."""
+    import subprocess
+    import sys
+
+    db_path = tmp_path / "cli_test.db"
+    chroma_dir = tmp_path / "cli_chroma"
+    docs_dir = tmp_path / "cli_docs"
+    docs_dir.mkdir(parents=True, exist_ok=True)
+
+    doc_file = docs_dir / "sample_cli.txt"
+    doc_file.write_text("Software Engineering: Agile methodologies and Scrum sprint planning cycles.")
+
+    script_path = Path(__file__).resolve().parent.parent / "scripts" / "reindex_database.py"
+
+    cmd = [
+        sys.executable,
+        str(script_path),
+        "--env", "testing",
+        "--db-path", str(db_path),
+        "--chroma-dir", str(chroma_dir),
+        "--documents-dir", str(docs_dir),
+        "--force"
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    assert result.returncode == 0, f"Script failed with stderr: {result.stderr}"
+    assert "[SUCCESS] Reindex completed:" in result.stdout
+    assert "Successfully Reindexed" in result.stdout
+

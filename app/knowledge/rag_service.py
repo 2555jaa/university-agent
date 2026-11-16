@@ -1,6 +1,7 @@
 """RAG service orchestrating document ingestion, retrieval, catalog synchronization, safe deletion, and failure recovery."""
 
 import asyncio
+from enum import Enum
 import hashlib
 import logging
 from pathlib import Path
@@ -16,6 +17,13 @@ from app.security.audit import audit_logger
 from app.memory.database import db as default_db
 
 logger = logging.getLogger("university_agent.knowledge.rag")
+
+
+class ContextStatus(str, Enum):
+    FOUND = "found"
+    INSUFFICIENT_EVIDENCE = "insufficient_evidence"
+    NO_DOCUMENTS = "no_documents"
+    ERROR = "error"
 
 
 class IngestionResult(BaseModel):
@@ -38,6 +46,8 @@ class GroundedContext(BaseModel):
     context_text: str
     citations: List[Dict[str, Any]] = Field(default_factory=list)
     has_relevant_info: bool = False
+    status: ContextStatus = ContextStatus.NO_DOCUMENTS
+    threshold_applied: Optional[float] = None
 
 
 class RAGService:
@@ -359,21 +369,41 @@ class RAGService:
         query: str,
         subject: Optional[str] = None,
         top_k: Optional[int] = None,
-        score_threshold: Optional[float] = None
+        score_threshold: Optional[float] = None,
+        filters: Optional[Dict[str, Any]] = None,
+        hybrid: Optional[bool] = None
     ) -> GroundedContext:
-        """Retrieve relevant passages and format them with explicit, heading-aware citation markers."""
+        """Retrieve relevant passages and format them with explicit, heading-aware citation markers.
+
+        Enforces strict relevance thresholds to prevent hallucination.
+        Returns structured ContextStatus (FOUND, INSUFFICIENT_EVIDENCE, NO_DOCUMENTS).
+        """
+        threshold_applied = score_threshold if score_threshold is not None else getattr(self.settings, "RAG_SIMILARITY_THRESHOLD", 0.45)
         results: List[SearchResult] = await self.store.search(
             query=query,
             top_k=top_k,
             subject=subject,
-            score_threshold=score_threshold
+            score_threshold=score_threshold,
+            filters=filters,
+            hybrid=hybrid
         )
 
         if not results:
+            total_in_index = self.store.get_index_status().get("total_chunks", 0)
+            if total_in_index == 0:
+                return GroundedContext(
+                    context_text="No academic documents are indexed in the local knowledge base.",
+                    citations=[],
+                    has_relevant_info=False,
+                    status=ContextStatus.NO_DOCUMENTS,
+                    threshold_applied=threshold_applied
+                )
             return GroundedContext(
-                context_text="No relevant academic documents found in local knowledge base.",
+                context_text="I don't have enough information in your notes to answer this. No relevant passages met the required similarity threshold.",
                 citations=[],
-                has_relevant_info=False
+                has_relevant_info=False,
+                status=ContextStatus.INSUFFICIENT_EVIDENCE,
+                threshold_applied=threshold_applied
             )
 
         context_blocks = []
@@ -403,50 +433,198 @@ class RAGService:
         return GroundedContext(
             context_text=formatted_context,
             citations=citations,
-            has_relevant_info=True
+            has_relevant_info=True,
+            status=ContextStatus.FOUND,
+            threshold_applied=threshold_applied
         )
 
-    async def reindex_all_documents(self, force: bool = False) -> Dict[str, Any]:
-        """Safely reindex all documents stored in the documents directory with SQLite catalog synchronization."""
-        doc_dir = self.settings.DOCUMENTS_DIR
-        if not doc_dir.exists():
-            return {"status": "no_documents_directory", "reindexed": 0, "skipped": 0, "failed": 0}
+    async def reindex_all(self, force_re_embed: bool = False) -> Dict[str, Any]:
+        """Completely rebuild the vector store from SQLite documents catalog and physical documents."""
+        async with self._ingest_lock:
+            doc_dir = self.settings.DOCUMENTS_DIR
+            logger.info(f"Starting full reindex_all job (force_re_embed={force_re_embed}, docs_dir={doc_dir})...")
 
-        reindexed = 0
-        skipped = 0
-        failed = 0
-        details = []
+            # 1. Clear VectorStore & Rebuild collection
+            if hasattr(self.store, "clear"):
+                self.store.clear()
+            else:
+                if getattr(self.store, "_chroma_client", None) is not None:
+                    try:
+                        self.store._chroma_client.delete_collection(self.store.COLLECTION_NAME)
+                    except Exception:
+                        pass
+                    self.store._collection = self.store._chroma_client.create_collection(
+                        name=self.store.COLLECTION_NAME,
+                        metadata={"hnsw:space": "cosine"}
+                    )
+                self.store._fallback_chunks.clear()
+                self.store._fallback_vectors.clear()
+                self.store._document_registry.clear()
 
-        allowed_exts = {".pdf", ".docx", ".doc", ".txt", ".md"}
-        files = [p for p in doc_dir.iterdir() if p.is_file() and p.suffix.lower() in allowed_exts and p.stat().st_size > 0]
+            # 2. Fetch all document catalog records from SQLite
+            catalog_docs = await self.db.list_documents() if self.db else []
+            processed_filenames = set()
+            reindexed_count = 0
+            missing_count = 0
+            failed_count = 0
+            total_chunks = 0
+            details = []
 
-        for file_path in files:
-            try:
-                res = await self.ingest_document(file_path, force_reindex=force)
-                if res.is_duplicate:
-                    skipped += 1
-                    details.append({"filename": file_path.name, "action": "skipped_duplicate"})
-                else:
-                    reindexed += 1
+            # 3. Process catalog records
+            for doc in catalog_docs:
+                filename = doc["filename"]
+                processed_filenames.add(filename)
+                doc_id = doc["id"]
+                subject = doc.get("subject_id")
+
+                file_path = None
+                if doc.get("file_path"):
+                    candidate = Path(doc["file_path"]).resolve()
+                    if candidate.exists() and candidate.is_file():
+                        file_path = candidate
+
+                if not file_path and doc_dir.exists():
+                    candidate = (doc_dir / filename).resolve()
+                    if candidate.exists() and candidate.is_file():
+                        file_path = candidate
+
+                if not file_path:
+                    # Missing physical file on disk
+                    missing_count += 1
+                    logger.warning(f"Reindex: physical file missing for catalog record '{filename}' (ID: {doc_id}).")
+                    if self.db:
+                        await self.db.upsert_document(
+                            doc_id=doc_id,
+                            filename=filename,
+                            file_path=str(doc.get("file_path") or (doc_dir / filename)),
+                            file_hash=doc.get("file_hash", "0" * 64),
+                            file_type=doc.get("file_type", "unknown"),
+                            file_size_bytes=doc.get("file_size_bytes", 0),
+                            subject_id=subject,
+                            title=doc.get("title"),
+                            page_count=doc.get("page_count", 0),
+                            chunk_count=0,
+                            status="failed",
+                            error_message="File missing on disk"
+                        )
                     details.append({
-                        "filename": file_path.name,
-                        "action": "reindexed",
-                        "chunks": res.total_chunks,
-                        "pages": res.total_pages
+                        "filename": filename,
+                        "document_id": doc_id,
+                        "status": "failed",
+                        "error": "File missing on disk"
                     })
-            except Exception as e:
-                failed += 1
-                logger.error(f"Reindexing failed for {file_path.name}: {e}")
-                details.append({"filename": file_path.name, "action": "failed", "error": str(e)})
+                    continue
 
-        return {
-            "status": "success",
-            "total_files": len(files),
-            "reindexed": reindexed,
-            "skipped": skipped,
-            "failed": failed,
-            "details": details
-        }
+                try:
+                    parsed = self.parser.parse_document(file_path, subject=subject)
+                    file_hash = parsed.file_hash or parsed.sha256
+                    chunks = self.chunker.chunk_document(parsed)
+                    for ch in chunks:
+                        ch.document_id = doc_id
+
+                    indexed_chunks = await self.store.add_chunks(chunks, file_sha256=file_hash)
+                    total_chunks += indexed_chunks
+                    reindexed_count += 1
+
+                    if self.db:
+                        await self.db.upsert_document(
+                            doc_id=doc_id,
+                            filename=filename,
+                            file_path=str(file_path),
+                            file_hash=file_hash,
+                            file_type=parsed.file_type,
+                            file_size_bytes=parsed.file_size_bytes,
+                            subject_id=subject,
+                            title=parsed.title,
+                            page_count=len(parsed.pages),
+                            chunk_count=indexed_chunks,
+                            status="indexed",
+                            error_message=None
+                        )
+                    details.append({
+                        "filename": filename,
+                        "document_id": doc_id,
+                        "status": "reindexed",
+                        "chunks": indexed_chunks,
+                        "pages": len(parsed.pages)
+                    })
+                except Exception as e:
+                    failed_count += 1
+                    logger.error(f"Reindex error parsing/embedding '{filename}': {e}")
+                    if self.db:
+                        await self.db.upsert_document(
+                            doc_id=doc_id,
+                            filename=filename,
+                            file_path=str(file_path),
+                            file_hash=doc.get("file_hash", "0" * 64),
+                            file_type=doc.get("file_type", "unknown"),
+                            file_size_bytes=doc.get("file_size_bytes", 0),
+                            subject_id=subject,
+                            title=doc.get("title"),
+                            page_count=doc.get("page_count", 0),
+                            chunk_count=0,
+                            status="failed",
+                            error_message=str(e)
+                        )
+                    details.append({
+                        "filename": filename,
+                        "document_id": doc_id,
+                        "status": "failed",
+                        "error": str(e)
+                    })
+
+            # 4. Check for physical files in DOCUMENTS_DIR not in catalog
+            if doc_dir.exists():
+                allowed_exts = {".pdf", ".docx", ".doc", ".txt", ".md"}
+                for p in doc_dir.iterdir():
+                    if p.is_file() and p.suffix.lower() in allowed_exts and p.name not in processed_filenames:
+                        try:
+                            res = await self.ingest_document(p, force_reindex=True)
+                            reindexed_count += 1
+                            total_chunks += res.total_chunks
+                            details.append({
+                                "filename": p.name,
+                                "document_id": res.document_id,
+                                "status": "indexed_new",
+                                "chunks": res.total_chunks,
+                                "pages": res.total_pages
+                            })
+                        except Exception as e:
+                            failed_count += 1
+                            details.append({
+                                "filename": p.name,
+                                "status": "failed",
+                                "error": str(e)
+                            })
+
+            self.audit.log_event(
+                event_type="document_reindex",
+                action="reindex_all",
+                details={
+                    "total_catalog": len(catalog_docs),
+                    "reindexed": reindexed_count,
+                    "missing": missing_count,
+                    "failed": failed_count,
+                    "total_chunks": total_chunks
+                },
+                risk_level="medium",
+                status="success"
+            )
+
+            return {
+                "ok": True,
+                "status": "completed",
+                "total_catalog_documents": len(catalog_docs),
+                "reindexed": reindexed_count,
+                "missing": missing_count,
+                "failed": failed_count,
+                "total_chunks": total_chunks,
+                "details": details
+            }
+
+    async def reindex_all_documents(self, force: bool = False) -> Dict[str, Any]:
+        """Backward-compatible alias for reindex_all."""
+        return await self.reindex_all(force_re_embed=force)
 
 
 rag_service = RAGService()
