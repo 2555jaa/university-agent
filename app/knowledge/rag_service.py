@@ -13,7 +13,7 @@ from app.config import settings
 from app.knowledge.document_parser import document_parser, DocumentParseError
 from app.knowledge.chunker import academic_chunker
 from app.knowledge.vector_store import vector_store, SearchResult
-from app.security.audit import audit_logger
+from app.security.audit import audit_logger, AuditLogger
 from app.memory.database import db as default_db
 
 logger = logging.getLogger("university_agent.knowledge.rag")
@@ -66,7 +66,12 @@ class RAGService:
         self.parser = parser or document_parser
         self.chunker = chunker or academic_chunker
         self.store = store or vector_store
-        self.audit = audit or audit_logger
+        if audit is not None:
+            self.audit = audit
+        elif settings_obj is not None:
+            self.audit = AuditLogger(settings_obj=self.settings)
+        else:
+            self.audit = audit_logger
         self.db = db if db is not None else default_db
         self._ingest_lock = asyncio.Semaphore(1)
 

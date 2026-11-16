@@ -81,6 +81,7 @@ def isolated_sandbox(monkeypatch, tmp_path):
     monkeypatch.setattr("app.knowledge.rag_service.vector_store", container.vector_store, raising=False)
     monkeypatch.setattr("app.knowledge.rag_service.default_db", container.db, raising=False)
     monkeypatch.setattr("app.knowledge.rag_service.embedding_manager", container.embedding_manager, raising=False)
+    monkeypatch.setattr("app.knowledge.rag_service.audit_logger", container.audit_logger, raising=False)
     monkeypatch.setattr("app.knowledge.vector_store.embedding_manager", container.embedding_manager, raising=False)
 
     # In app.api.routes module globals:
