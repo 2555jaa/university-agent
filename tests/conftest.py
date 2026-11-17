@@ -96,12 +96,18 @@ def isolated_sandbox(monkeypatch, tmp_path):
     # In app.main singleton app:
     monkeypatch.setattr(app.state, "services", container, raising=False)
 
-    # In app.tools:
+    # In app.tools & app.services:
     monkeypatch.setattr("app.tools.filesystem_tools.security_validator", container.security_validator, raising=False)
     monkeypatch.setattr("app.tools.filesystem_tools.audit_logger", container.audit_logger, raising=False)
     monkeypatch.setattr("app.tools.terminal_tools.security_validator", container.security_validator, raising=False)
     monkeypatch.setattr("app.tools.terminal_tools.audit_logger", container.audit_logger, raising=False)
     monkeypatch.setattr("app.tools.browser_tools.audit_logger", container.audit_logger, raising=False)
+    try:
+        from app.services.file_service import file_service
+        monkeypatch.setattr(file_service, "_validator", container.security_validator, raising=False)
+        monkeypatch.setattr(file_service, "_audit_logger", container.audit_logger, raising=False)
+    except ImportError:
+        pass
 
     yield container
 

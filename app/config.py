@@ -37,6 +37,7 @@ class Settings(BaseSettings):
     BASE_DIR: Path = PROJECT_ROOT
     DATA_DIR: Optional[Path] = None
     DOCUMENTS_DIR: Optional[Path] = None
+    WORKSPACE_DIR: Optional[Path] = None
     CHROMA_DIR: Optional[Path] = None
     SQLITE_PATH: Optional[Path] = None
     AUDIT_LOG_PATH: Optional[Path] = None
@@ -166,6 +167,7 @@ class Settings(BaseSettings):
         derived = {
             "DATA_DIR": data_dir,
             "DOCUMENTS_DIR": data_dir / "documents",
+            "WORKSPACE_DIR": (base / "workspace"),
             "CHROMA_DIR": data_dir / "chroma",
             "SQLITE_PATH": data_dir / "university_agent.db",
             "AUDIT_LOG_PATH": data_dir / "audit.log",
