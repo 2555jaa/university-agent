@@ -27,6 +27,13 @@ class ServiceContainer:
     audit_logger: AuditLogger
     security_validator: SecurityValidator
 
+    async def shutdown(self) -> None:
+        """Safely close database connections and flush vector store resources during graceful shutdown."""
+        if hasattr(self.db, "close"):
+            await self.db.close()
+        if hasattr(self.vector_store, "close"):
+            self.vector_store.close()
+
 
 def create_service_container(custom_settings: Optional[Settings] = None) -> ServiceContainer:
     """Factory creating an isolated ServiceContainer for a specific Settings configuration."""

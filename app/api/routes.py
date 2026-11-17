@@ -10,7 +10,7 @@ import uuid
 import time
 from unittest.mock import AsyncMock
 from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile, status, Query
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 logger = logging.getLogger("university_agent.api.routes")
@@ -36,30 +36,51 @@ router = APIRouter()
 # --- HEALTH & STATUS ---
 
 @router.get("/health")
+@router.get("/system/health")
 async def health_check(request: Request):
     services = get_services(request)
     s = services.settings
-    ollama_ok = await OllamaProvider(settings_obj=s).is_available()
+    ollama_provider = OllamaProvider(settings_obj=s)
+    ollama_ok = await ollama_provider.is_available()
+    loaded_models = await ollama_provider.get_loaded_models() if ollama_ok else []
     cloud_ok = await CloudAIProvider(settings_obj=s).is_available()
     emb_health = await services.embedding_manager.check_health()
-    db_health = await services.db.check_health()
-    vec_status = services.vector_store.get_index_status()
 
-    is_healthy = db_health.get("status") == "ok"
-    status_str = "healthy" if is_healthy else "degraded"
+    try:
+        db_health = await services.db.check_health()
+    except Exception as e:
+        db_health = {"status": "error", "error": str(e)}
 
-    return {
+    try:
+        vec_status = services.vector_store.get_index_status()
+    except Exception as e:
+        vec_status = {"status": "error", "error": str(e)}
+
+    db_ok = db_health.get("status") == "ok"
+    vec_ok = vec_status.get("status") in ("ok", "healthy")
+    core_healthy = db_ok and vec_ok
+
+    total_chunks = vec_status.get("total_chunks", 0)
+    collection_size = vec_status.get("collection_size", total_chunks)
+
+    status_str = "healthy" if core_healthy else "unhealthy"
+
+    payload = {
         "status": status_str,
         "environment": s.APP_ENV,
         "app_name": s.APP_NAME,
         "version": s.APP_VERSION,
-        "database": db_health,
+        "database": {
+            **db_health,
+            "status": "ok" if db_ok else "down"
+        },
         "vector_store": {
             "mode": vec_status.get("mode", "fallback_json"),
-            "status": vec_status.get("status", "ok"),
+            "status": "ok" if vec_ok else "down",
             "backend": vec_status.get("backend", "fallback_json"),
             "total_documents": vec_status.get("total_documents", 0),
-            "total_chunks": vec_status.get("total_chunks", 0),
+            "total_chunks": total_chunks,
+            "collection_size": collection_size,
         },
         "embeddings": {
             "status": emb_health.get("status", "unknown"),
@@ -69,11 +90,25 @@ async def health_check(request: Request):
             "dimension": emb_health.get("dimension", 0),
             "error": emb_health.get("error"),
         },
+        "ollama": {
+            "status": "ok" if ollama_ok else "unavailable",
+            "available": ollama_ok,
+            "base_url": s.OLLAMA_BASE_URL,
+            "model": s.LOCAL_MODEL,
+            "models_available": loaded_models,
+        },
+        "cloud": {
+            "status": "ok" if cloud_ok else ("disabled" if not s.CLOUD_ENABLED else "unavailable"),
+            "enabled": s.CLOUD_ENABLED,
+            "available": cloud_ok,
+            "model": s.CLOUD_MODEL,
+        },
         "llm_providers": {
             "ollama": {
                 "available": ollama_ok,
                 "base_url": s.OLLAMA_BASE_URL,
                 "model": s.LOCAL_MODEL,
+                "models_available": loaded_models,
             },
             "cloud": {
                 "available": cloud_ok,
@@ -91,6 +126,10 @@ async def health_check(request: Request):
         "embedding_dimension": emb_health.get("dimension", 0),
         "embedding_status": emb_health.get("status", "unknown"),
     }
+
+    if not core_healthy:
+        return JSONResponse(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, content=payload)
+    return JSONResponse(status_code=status.HTTP_200_OK, content=payload)
 
 
 @router.get("/system/status")

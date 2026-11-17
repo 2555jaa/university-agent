@@ -1,182 +1,291 @@
-# Local University AI Agent
+# 🎓 Local University AI Agent
 
-A privacy-first, modular, hybrid AI agent built for university students, personal tutoring, academic research, and safe PC assistance on Linux.
+[![Python 3.12](https://img.shields.io/badge/python-3.12-blue.svg)](https://www.python.org/downloads/)
+[![FastAPI](https://img.shields.io/badge/FastAPI-0.135-009688.svg)](https://fastapi.tiangolo.com/)
+[![SQLite](https://img.shields.io/badge/SQLite-WAL%20Mode-003B57.svg)](https://sqlite.org/)
+[![ChromaDB](https://img.shields.io/badge/ChromaDB-Vector%20Store-orange.svg)](https://www.trychroma.com/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-Designed specifically for resource-constrained environments (Intel Core i5, 8GB RAM, integrated graphics), this system optimizes for low memory footprint, zero unnecessary background bloat, and offline-first private document processing.
+A **local-first, privacy-respecting academic copilot and tutoring agent** designed for university students, educators, and researchers.
 
----
-
-## 🏛 System Architecture & Capabilities
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                 User Interfaces                             │
-│   • Built-in Web UI (http://127.0.0.1:8000)                 │
-│   • Open WebUI Chat (OpenAI API /v1/chat/completions)       │
-│   • REST API / OpenAPI Swagger (/docs)                      │
-└──────────────┬──────────────────────────────┬───────────────┘
-               │                              │
-┌──────────────▼──────────────────────────────▼───────────────┐
-│                     FastAPI Agent Backend                   │
-│   • University Tutor Mode     • Academic Research Mode      │
-│   • Assignment Planner        • Quiz & Mastery Evaluator    │
-└──────────────┬──────────────┬───────────────┬───────────────┘
-               │              │               │
-┌──────────────▼────┐  ┌──────▼──────┐  ┌─────▼───────────────┐
-│  Hybrid Router    │  │ RAG Engine  │  │ SQLite Memory       │
-│ • Local: Ollama   │  │ • PyMuPDF   │  │ • Subjects & Topics │
-│   (Qwen 1.5B/1.7B)│  │ • docx/txt  │  │ • Mastery Progress  │
-│ • Cloud: Optional │  │ • Vector DB │  │ • Tasks & Deadlines │
-│   (Gemini/OpenAI) │  │ • Citations │  │ • Chat Sessions     │
-└───────────────────┘  └─────────────┘  └─────────────────────┘
-               │
-┌──────────────▼──────────────────────────────────────────────┐
-│                  Restricted PC Tools & Security             │
-│ • Safe File Reader     • Material Organizer                 │
-│ • Whitelisted Shell    • Human-in-the-Loop Approval Manager │
-│ • Append-Only Forensic Audit Logging (audit.log)            │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### Key Capabilities
-
-1. **University Tutor**:
-   - Socratic step-by-step concept instruction.
-   - Adaptive explanations matched to student mastery level.
-   - Dynamic practice quiz generation and mistake evaluation.
-   - Persistent mastery score recalculation.
-
-2. **Academic Research & Grounded RAG**:
-   - Ingestion of PDF, Word (.docx), and plain text (.txt, .md).
-   - Intelligent sliding-window chunking with page number retention.
-   - Strict source attribution `[Source: <filename>, Page: <page>]`.
-   - Zero hallucination policy: unsupported claims are explicitly rejected.
-
-3. **Persistent SQLite Memory**:
-   - Survives application restarts.
-   - Tracks subjects, topics, quiz scores, academic tasks, deadlines, and conversation history.
-
-4. **Hybrid AI Model Routing**:
-   - Local Ollama inference for private course documents, tutoring, and summarization.
-   - Cloud AI routing (Gemini / OpenAI) for advanced research, complex proofs, and code debugging.
-   - Guardrail: Confidential and private academic documents are strictly restricted to local execution.
-
-5. **Restricted PC Assistance & Security**:
-   - Whitelisted inspection commands only (`ls`, `stat`, `date`, `pwd`, `wc`, `head`, `tail`).
-   - High-risk operations (file deletion, arbitrary shell commands) require explicit human approval tokens.
-   - All tool calls and security decisions recorded to `audit.log`.
+Optimized specifically for resource-constrained consumer hardware (e.g. Intel Core i5, 8GB RAM, integrated graphics), the agent delivers grounded Socratic tutoring, accurate document research, automated practice quizzes with exponential moving average (EMA) mastery tracking, and safe sandboxed system execution with zero telemetry or data leakage.
 
 ---
 
-## 💻 Hardware & Environment Constraints
+## 🏛 System Architecture Overview
 
-- **Detected OS**: Ubuntu 26.04 LTS (x86_64)
-- **CPU**: Intel Core i5-1035G1 (4 cores, 8 threads)
-- **RAM**: ~7 GiB (Optimized for < 2GB available headroom)
-- **GPU**: Intel Iris Plus Graphics (CPU inference mode)
-- **Local Model**: Qwen 2.5 1.5B (~986 MB in-memory)
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│                        User Interfaces & Clients                       │
+│   • Built-in Reactive Web UI (SSE Streaming, Badges, Modals)           │
+│   • Open WebUI Integration (Standard OpenAI /v1/chat/completions)      │
+│   • REST API / Interactive Swagger Documentation (/docs)               │
+└───────────────────┬────────────────────────────────┬───────────────────┘
+                    │                                │
+┌───────────────────▼────────────────────────────────▼───────────────────┐
+│                          FastAPI Agent Backend                         │
+│   • Tutor Mode (Socratic)            • Research Mode (Citations)       │
+│   • Assignment Guardrail Planner     • Interactive Quiz Evaluator      │
+└─────────┬───────────────────┬───────────────────┬──────────────────────┘
+          │                   │                   │
+┌─────────▼─────────┐ ┌───────▼─────────┐ ┌───────▼──────────────────────┐
+│   Hybrid Router   │ │   RAG Pipeline  │ │  SQLite Memory & Progress    │
+│ • Local: Ollama   │ │ • PyMuPDF/DOCX  │ │ • Schema Migrations (v1-v3)  │
+│   (Qwen / Llama)  │ │ • Hybrid Search │ │ • Topic Mastery EMA Tracking │
+│ • Cloud: Failover │ │ • Citations     │ │ • Academic Tasks & Deadlines │
+│   (Gemini/OpenAI) │ │ • XML Fencing   │ │ • Study Goals Progress       │
+└───────────────────┘ └─────────────────┘ └──────────────────────────────┘
+          │
+┌─────────▼──────────────────────────────────────────────────────────────┐
+│                    Restricted Sandbox & Tool Security                  │
+│ • AST Code Execution Sandbox (Timeout & Import Isolation)              │
+│ • Strict Terminal Command Whitelisting & Shell Injection Prevention    │
+│ • Path Traversal Defenses (`is_relative_to` Base Enclosure)            │
+│ • Human-in-the-Loop Approval Tokens (Single-Use, Cryptographic Hash)   │
+│ • Append-Only Forensic Audit Logging (`logs/audit.log`)                │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## ✨ Key Features
+
+1. **Real-Time SSE Streaming Chat & Collapsible Reasoning Paths**:
+   - Streams assistant tokens via Server-Sent Events (`POST /api/chat` and `/v1/chat/completions`).
+   - Automatically extracts `<think>...</think>` tokens and renders them inside interactive collapsible reasoning accordions in the UI.
+
+2. **Grounded Academic RAG & Accurate Citation Badges**:
+   - Ingests **PDF** (PyMuPDF `fitz`), **Word** (`.docx`), **Markdown**, and **Plain Text**.
+   - Preserves page numbers, section headers, tables, and theorems.
+   - Hybrid Search combining dense vector cosine similarity (ChromaDB) and lexical BM25-style keyword search with anisotropy normalization.
+   - Renders numbered citation badges (`[1]`, `[2]`) that smoothly scroll to source cards containing exact filenames, page numbers, and preview text.
+   - Unsupported or unverified queries trigger strict threshold rejection rather than model hallucination.
+
+3. **Interactive Practice Quizzes & Mastery Tracking**:
+   - Generates multi-question diagnostic quizzes on any tracked subject or topic.
+   - Interactive quiz modal allowing option selection and instant grading.
+   - Evaluates answers against ground truth course chunks and updates topic mastery using an **Exponential Moving Average (EMA)** (`α = 0.2`):
+     $$\text{Mastery}_{t} = (1 - \alpha) \cdot \text{Mastery}_{t-1} + \alpha \cdot \text{Score}$$
+   - Live mastery progress bars displayed on the student dashboard.
+
+4. **Academic Task Management & Study Goals**:
+   - Track assignments, reading lists, and project milestones with priority badges (`High`, `Medium`, `Low`).
+   - Filter views for **Upcoming** tasks (due within 7 days) and **Overdue** tasks.
+   - Goal progress tracking with interactive sliders and quick-increment completion buttons.
+
+5. **Hardened Security & Sandboxed Tool Execution**:
+   - **AST Validation**: Code execution evaluates Python syntax trees, blocking forbidden system imports (`os`, `sys`, `subprocess`, `socket`, `shutil`).
+   - **Command Whitelisting**: Strictly restricts terminal actions to safe developer utilities (`python`, `node`, `ls`, `cat`, `echo`, `grep`, `ollama`, `pytest`) while rejecting shell metacharacters (`;`, `&&`, `|`, `>`, `<`).
+   - **Path Traversal Protection**: Enforces canonical path verification (`Path.resolve().is_relative_to()`) to lock operations within authorized workspace boundaries.
+   - **Human-in-the-Loop Approvals**: High-risk actions generate single-use, cryptographically verified approval tokens requiring user confirmation in the chat interface.
+
+6. **Open WebUI & OpenAI Standard Compatibility**:
+   - Serves `GET /v1/models` and `POST /v1/chat/completions` (streaming & non-streaming).
+   - Exposes virtual academic persona models:
+     - `university-agent`: Default auto-routing intent
+     - `university-agent-tutor`: Socratic tutoring persona
+     - `university-agent-research`: Deep research with citations
+     - `university-agent-assignment`: Assignment breakdown and planning
+
+7. **Production Resilience & Auto-Restart**:
+   - Production ASGI runner with worker pooling, crash watchdog, and auto-restart loop (`scripts/run_production.sh`).
+   - Graceful shutdown lifecycle: flushes pending index writes, terminates ChromaDB subsystems, and triggers SQLite WAL checkpointing (`PRAGMA wal_checkpoint(TRUNCATE);`).
+   - Production Docker container and `systemd` service unit template included.
+
+---
+
+## 💻 Hardware & System Requirements
+
+- **Operating System**: Linux (Ubuntu 22.04+ / Debian 12+ recommended; macOS and WSL2 compatible).
+- **Python**: Version 3.12+ (tested up to 3.14).
+- **RAM**: Minimum 4 GB; 8 GB recommended for local LLM inference.
+- **Local LLM Engine**: [Ollama](https://ollama.com/) (e.g. `qwen2.5:1.5b`, `qwen2.5:3b`, or `llama3.2:1b`).
 
 ---
 
 ## 🚀 Quickstart Guide
 
-### 1. Prerequisites
-Ensure Python 3.12+ (or 3.14) and Ollama are installed:
-```bash
-# Verify Ollama
-ollama --version
+### 1. Clone & Set Up Environment
 
-# Verify Python
-python3 --version
+```bash
+git clone https://github.com/your-username/university-agent.git
+cd university-agent
+
+# Create and activate Python virtual environment
+python3 -m venv .venv
+source .venv/bin/activate
+
+# Install dependencies
+pip install --upgrade pip
+pip install -r requirements.txt
 ```
 
-### 2. Configure Environment
-Copy the example environment file:
+### 2. Configure Settings
+
+Copy the example environment configuration:
+
 ```bash
 cp .env.example .env
 ```
 
-The default `APP_ENV=development` preserves the project's existing `./data`
-location. For isolated test runs, use `APP_ENV=testing`; this selects a dedicated
-temporary data root and rejects paths overlapping development or production data.
-Production defaults to `~/.local/share/university-agent`, or can use an explicit
-`DATA_DIR`. Environment variables override `.env` values.
+Review or edit `.env` parameters:
 
-Edit `.env` if you want to enable cloud models (optional):
 ```ini
+APP_ENV=development
+LOG_LEVEL=INFO
+
+# Ollama local inference
 OLLAMA_BASE_URL=http://127.0.0.1:11434
 LOCAL_MODEL=qwen2.5:1.5b
 
-# Optional Cloud API
+# Optional Cloud API Failover (Gemini / OpenAI)
 CLOUD_ENABLED=false
-# Set CLOUD_API_KEY only in your private .env when cloud access is enabled.
+CLOUD_API_KEY=
 CLOUD_MODEL=gemini-2.5-flash
+
+# Storage Paths (defaults to ./data in development)
+WORKSPACE_DIR=./data/workspace
+DOCUMENTS_DIR=./data/documents
+CHROMA_DIR=./data/chroma
+SQLITE_PATH=./data/university_agent.db
 ```
 
 ### 3. Launch Ollama & Pull Local Model
+
 ```bash
+# Start Ollama service (if not already running as a system daemon)
 ollama serve &
+
+# Pull the lightweight academic local model
 ollama pull qwen2.5:1.5b
 ```
 
-### 4. Run the Agent Backend
+### 4. Seed Academic Workspace (Optional)
+
+Seed sample course syllabi, subjects, discrete math topics, and initial tasks:
+
+```bash
+.venv/bin/python scripts/seed_database.py
+```
+
+### 5. Run the Application
+
+#### Development Mode (with hot-reload):
 ```bash
 ./scripts/run_agent.sh
 ```
-The server will start on `http://127.0.0.1:8000`:
-- **Web Interface**: `http://127.0.0.1:8000/`
-- **Interactive API Documentation**: `http://127.0.0.1:8000/docs`
-- **OpenAI Compatible API**: `http://127.0.0.1:8000/v1`
+
+#### Production Mode (with worker group & auto-restart watchdog):
+```bash
+./scripts/run_production.sh
+```
+
+The service is available at:
+- **Interactive Web Interface**: [http://127.0.0.1:8000/](http://127.0.0.1:8000/)
+- **Swagger / OpenAPI Documentation**: [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs)
+- **Diagnostic System Health**: [http://127.0.0.1:8000/api/system/health](http://127.0.0.1:8000/api/system/health)
+- **Open WebUI Endpoint**: `http://127.0.0.1:8000/v1`
 
 ---
 
 ## 🌐 Connecting Open WebUI
 
-Open WebUI can be connected to the agent using the OpenAI API standard:
+To use the agent inside [Open WebUI](https://github.com/open-webui/open-webui):
 
-1. Launch Open WebUI (via Docker or local package):
+1. Start Open WebUI:
    ```bash
-   docker run -d -p 3000:8080 -e OPENAI_API_BASE_URL=http://host.docker.internal:8000/v1 -e OPENAI_API_KEY=local --add-host=host.docker.internal:host-gateway --name open-webui --restart always ghcr.io/open-webui/open-webui:main
+   docker run -d -p 3000:8080 \
+     -e OPENAI_API_BASE_URL=http://host.docker.internal:8000/v1 \
+     -e OPENAI_API_KEY=local \
+     --add-host=host.docker.internal:host-gateway \
+     --name open-webui \
+     ghcr.io/open-webui/open-webui:main
    ```
 2. Navigate to `http://localhost:3000`.
-3. In Open WebUI Settings → Connections → OpenAI API:
-   - URL: `http://localhost:8000/v1` (or `http://host.docker.internal:8000/v1` in Docker)
-   - Key: `local`
-4. The models `university-tutor` and `university-research` will appear automatically in the dropdown!
+3. In **Settings → Connections → OpenAI API**:
+   - **URL**: `http://host.docker.internal:8000/v1` (or `http://localhost:8000/v1` for local installs)
+   - **API Key**: `local`
+4. The academic personas (`university-agent`, `university-agent-tutor`, `university-agent-research`) will appear directly in your model selection dropdown.
 
 ---
 
-## 📚 Document Ingestion & RAG Usage
+## 📚 Example API Usage
 
-Ingest your course notes or syllabus via CLI:
+### 1. Check System Health & Diagnostics
 ```bash
-# Ingest single PDF or DOCX file
-.venv/bin/python scripts/ingest_documents.py /path/to/lecture_notes.pdf "Computer Science"
-
-# Ingest entire folder
-.venv/bin/python scripts/ingest_documents.py ./data/documents "Physics"
+curl -s http://127.0.0.1:8000/api/system/health | jq .
 ```
 
-Or ingest via API:
+### 2. Send Chat Query (Non-Streaming)
+```bash
+curl -X POST http://127.0.0.1:8000/api/chat \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "Explain how virtual memory paging handles page faults.",
+    "mode": "tutor",
+    "stream": false
+  }' | jq .
+```
+
+### 3. Stream Chat Query via SSE
+```bash
+curl -N -X POST http://127.0.0.1:8000/api/chat \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "What are discrete probability distributions?",
+    "stream": true
+  }'
+```
+
+### 4. Ingest Course Document
 ```bash
 curl -X POST http://127.0.0.1:8000/api/documents/upload \
-  -F "file=@lecture1.pdf" \
-  -F "subject=Calculus"
+  -F "file=@./data/documents/discrete_math.txt" \
+  -F "subject=Mathematics"
+```
+
+### 5. Generate & Evaluate a Topic Quiz
+```bash
+# 1. Generate Quiz (answers hidden)
+curl -X POST http://127.0.0.1:8000/api/agent/quiz \
+  -H "Content-Type: application/json" \
+  -d '{
+    "topic_name": "Virtual Memory",
+    "num_questions": 3,
+    "hide_answers": true
+  }' | jq .
+
+# 2. Evaluate Submitted Answers & Update Mastery EMA
+curl -X POST http://127.0.0.1:8000/api/agent/quiz/evaluate \
+  -H "Content-Type: application/json" \
+  -d '{
+    "topic_id": "top_vm_101",
+    "answers": {"0": "Paging", "1": "TLB", "2": "Thrashing"},
+    "quiz_data": { ... }
+  }' | jq .
 ```
 
 ---
 
-## 🧪 Running Verification Tests
+## 🧪 Testing & Verification
 
-Run the full automated test suite covering security, memory, RAG, and providers:
+Run the full automated test suite containing unit, integration, RAG, and security tests:
+
 ```bash
 .venv/bin/pytest -v
 ```
 
-All 22 unit and integration tests verify:
-- Path traversal defenses and approval workflows
-- SQLite topic mastery and quiz progress persistence
-- PDF, DOCX, and TXT parsing with PyMuPDF and python-docx
-- Vector similarity search and citation grounding
-- Hybrid local/cloud routing and fallback resilience
-- OpenAI-compatible endpoints for Open WebUI
+All 198 automated tests run against an isolated sandbox environment ensuring zero modifications to production `./data` files:
+- Architecture & dependency injection isolation
+- SQLite migrations, pragmas, and atomic rollback
+- PyMuPDF and python-docx parsing integrity
+- Semantic + BM25 hybrid retrieval and threshold filtering
+- AST sandboxing and command injection prevention
+- Real-time SSE streaming and OpenAI compatibility
+- Interactive quiz grading and EMA mastery calculations
+
+---
+
+## 📄 License
+
+This project is licensed under the MIT License. See [LICENSE](LICENSE) for details.

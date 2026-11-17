@@ -45,9 +45,21 @@ def create_app(custom_settings: Optional[Settings] = None) -> FastAPI:
         else:
             logger.warning(f"Ollama is currently unreachable at {s.OLLAMA_BASE_URL}")
 
+        # Verify vector store collections on startup
+        try:
+            status_vec = container.vector_store.get_index_status()
+            logger.info(f"Vector store verified (backend: {status_vec.get('backend')}, chunks: {status_vec.get('total_chunks', 0)})")
+        except Exception as e:
+            logger.warning(f"Vector store collection verification warning: {e}")
+
         yield
 
-        logger.info("Shutting down University AI Agent backend...")
+        logger.info("Shutting down University AI Agent backend (graceful shutdown)...")
+        try:
+            await container.shutdown()
+            logger.info("Graceful shutdown completed successfully.")
+        except Exception as e:
+            logger.error(f"Error during graceful shutdown: {e}")
 
     app_instance = FastAPI(
         title=s.APP_NAME,

@@ -1714,5 +1714,15 @@ class DatabaseManager:
             row = await cursor.fetchone()
             return row["value"] if row else default
 
+    async def close(self) -> None:
+        """Perform graceful shutdown: execute WAL checkpoint to flush pending transactions to main DB file."""
+        if str(self.db_path) != ":memory:" and Path(self.db_path).exists():
+            try:
+                async with self.get_connection() as conn:
+                    await conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+                logger.info("SQLite WAL checkpoint completed successfully during shutdown.")
+            except Exception as e:
+                logger.warning(f"WAL checkpoint during shutdown encountered error: {e}")
+
 
 db = DatabaseManager()

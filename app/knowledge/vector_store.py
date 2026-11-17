@@ -839,10 +839,26 @@ class VectorStore:
             "is_neural": self._index_metadata.get("is_neural", False),
             "total_documents": len(self._document_registry),
             "total_chunks": total_chunks,
+            "collection_size": total_chunks,
             "updated_at": self._index_metadata.get("updated_at", 0),
             "hybrid_search_enabled": getattr(self.settings, "RAG_HYBRID_SEARCH", True),
             "similarity_threshold": getattr(self.settings, "RAG_SIMILARITY_THRESHOLD", 0.35),
         }
+
+    def close(self) -> None:
+        """Safely flush and release vector store resources upon application shutdown."""
+        try:
+            if hasattr(self, "_save_fallback_index") and self._fallback_file:
+                self._save_fallback_index()
+            if self._chroma_client is not None:
+                if hasattr(self._chroma_client, "_system") and hasattr(self._chroma_client._system, "stop"):
+                    self._chroma_client._system.stop()
+                self._chroma_client = None
+                self._collection = None
+                self._chroma_initialized = False
+            logger.info("Vector store resources flushed and closed successfully.")
+        except Exception as e:
+            logger.warning(f"Error during vector store shutdown: {e}")
 
 
 vector_store = VectorStore(lazy_init=True)

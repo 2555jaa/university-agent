@@ -1,18 +1,28 @@
 """Integration tests for FastAPI endpoints, RAG upload, and Open WebUI OpenAI compatibility."""
 
 import json
+import uuid
 from unittest.mock import patch
 import pytest
 
 
 @pytest.mark.asyncio
 async def test_health_and_system_endpoints(async_client):
-    # Health
+    # Health endpoint /api/health and alias /api/system/health
     res = await async_client.get("/api/health")
     assert res.status_code == 200
     data = res.json()
     assert data["status"] == "healthy"
     assert "local_model" in data
+    assert data["database"]["status"] == "ok"
+    assert data["vector_store"]["status"] == "ok"
+    assert "collection_size" in data["vector_store"]
+    assert "ollama" in data
+    assert "cloud" in data
+
+    res_sys_health = await async_client.get("/api/system/health")
+    assert res_sys_health.status_code == 200
+    assert res_sys_health.json() == data
 
     # System status
     res_sys = await async_client.get("/api/system/status")
@@ -21,12 +31,49 @@ async def test_health_and_system_endpoints(async_client):
 
 
 @pytest.mark.asyncio
+async def test_health_endpoint_returns_503_on_database_failure(async_client, test_app):
+    """Verify health endpoints return 503 Service Unavailable when the database is down."""
+    from unittest.mock import AsyncMock
+    with patch.object(test_app.state.services.db, "check_health", new=AsyncMock(return_value={"status": "error", "error": "Disk I/O error"})):
+        res = await async_client.get("/api/system/health")
+        assert res.status_code == 503
+        data = res.json()
+        assert data["status"] == "unhealthy"
+        assert data["database"]["status"] == "down"
+
+        # Also test /api/health returns 503
+        res_h = await async_client.get("/api/health")
+        assert res_h.status_code == 503
+        assert res_h.json()["status"] == "unhealthy"
+
+
+@pytest.mark.asyncio
+async def test_health_endpoint_returns_503_on_vector_store_failure(async_client, test_app):
+    """Verify health endpoints return 503 Service Unavailable when the vector store is down."""
+    with patch.object(test_app.state.services.vector_store, "get_index_status", return_value={"status": "error", "error": "ChromaDB connection refused"}):
+        res = await async_client.get("/api/system/health")
+        assert res.status_code == 503
+        data = res.json()
+        assert data["status"] == "unhealthy"
+        assert data["vector_store"]["status"] == "down"
+
+
+@pytest.mark.asyncio
 async def test_chat_first_ui_and_static_assets(async_client):
+    # Verify duplicate app/static directory is eliminated from repository
+    from pathlib import Path
+    assert not Path("app/static").exists(), "app/static directory should be eliminated in favor of app/web/static"
+    assert Path("app/web/static").is_dir()
+
     page = await async_client.get("/")
     assert page.status_code == 200
     assert "Ask the University Agent" in page.text
     assert "/static/app.css" in page.text
     assert "/static/app.js" in page.text
+    assert "quiz-modal" in page.text
+    assert "task-filter-tabs" in page.text
+    assert "goal-list" in page.text
+    assert "doc-subject-filter" in page.text
 
     styles = await async_client.get("/static/app.css")
     assert styles.status_code == 200
@@ -35,11 +82,14 @@ async def test_chat_first_ui_and_static_assets(async_client):
     assert "reasoning-accordion" in styles.text
     assert "citation-badge" in styles.text
     assert "chat-approval-card" in styles.text
+    assert "mastery-track" in styles.text
+    assert "quiz-dialog" in styles.text
 
     # Also verify /static/styles.css alias
     styles_alias = await async_client.get("/static/styles.css")
     assert styles_alias.status_code == 200
     assert "reasoning-accordion" in styles_alias.text
+    assert "quiz-dialog" in styles_alias.text
 
     script = await async_client.get("/static/app.js")
     assert script.status_code == 200
@@ -51,6 +101,12 @@ async def test_chat_first_ui_and_static_assets(async_client):
     assert "renderApprovalCard" in script.text
     assert "/api/memory/sessions" in script.text
     assert "/api/security/approve/" in script.text
+    assert "/api/agent/quiz/evaluate" in script.text
+    assert "/api/goals" in script.text
+    assert "/api/tasks/upcoming" in script.text
+    assert "/api/tasks/overdue" in script.text
+    assert "openQuizModal" in script.text
+    assert "submitQuiz" in script.text
 
 
 @pytest.mark.asyncio
@@ -563,3 +619,81 @@ async def test_security_approval_endpoints_end_to_end(async_client, test_app):
     # 5. Non-existent ID returns 404
     bad_res = await async_client.post("/api/security/approve/nonexistent-id", json={})
     assert bad_res.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_agent_quiz_evaluate_endpoint_and_mastery_update(async_client, test_app):
+    """Verify POST /api/agent/quiz/evaluate scores submitted answers and updates topic mastery level via EMA."""
+    db = test_app.state.services.db
+
+    # Create subject and topic in DB
+    subj_id = f"subj_eval_{uuid.uuid4().hex[:8]}"
+    topic_id = f"top_eval_{uuid.uuid4().hex[:8]}"
+    await db.add_subject(subj_id, "Distributed Systems", "CS401", "Distributed computing concepts")
+    await db.add_or_update_topic(topic_id, subj_id, "Raft Consensus", mastery=0.2)
+
+    # Check baseline mastery
+    topics_before = await db.list_topics(subj_id)
+    topic_before = next((t for t in topics_before if t["id"] == topic_id), None)
+    assert topic_before is not None
+    assert topic_before["mastery_level"] == 0.2
+
+    # Prepare quiz evaluation request
+    payload = {
+        "topic_id": topic_id,
+        "answers": {
+            "0": "Leader",
+            "1": "Heartbeat",
+            "2": "Wrong Answer"
+        },
+        "quiz_data": {
+            "topic": "Raft Consensus",
+            "questions": [
+                {
+                    "question_text": "Who coordinates log replication in Raft?",
+                    "correct_answer": "Leader",
+                    "options": ["Leader", "Follower", "Candidate"],
+                    "explanation": "The elected leader handles all client requests and replication.",
+                    "source_chunk_id": "chunk_raft_1"
+                },
+                {
+                    "question_text": "What do leaders send to prevent election timeouts?",
+                    "correct_answer": "Heartbeat",
+                    "options": ["Heartbeat", "VoteRequest", "Snapshot"],
+                    "explanation": "Periodic heartbeats maintain leader authority.",
+                    "source_chunk_id": "chunk_raft_2"
+                },
+                {
+                    "question_text": "What is the minimum majority required for quorum?",
+                    "correct_answer": "Quorum Majority (N/2 + 1)",
+                    "options": ["Quorum Majority (N/2 + 1)", "Unanimous", "Single Node"],
+                    "explanation": "Raft requires a strict majority.",
+                    "source_chunk_id": "chunk_raft_3"
+                }
+            ]
+        }
+    }
+
+    res = await async_client.post("/api/agent/quiz/evaluate", json=payload)
+    assert res.status_code == 200
+    data = res.json()
+
+    assert data["topic_id"] == topic_id
+    assert data["total_questions"] == 3
+    assert data["correct_count"] == 2
+    assert abs(data["score"] - 0.6667) < 0.001
+    assert "evaluations" in data
+    assert len(data["evaluations"]) == 3
+
+    assert data["evaluations"][0]["is_correct"] is True
+    assert data["evaluations"][0]["source_chunk_id"] == "chunk_raft_1"
+    assert data["evaluations"][1]["is_correct"] is True
+    assert data["evaluations"][2]["is_correct"] is False
+
+    # Check that mastery level updated via EMA in database
+    topics_after = await db.list_topics(subj_id)
+    topic_after = next((t for t in topics_after if t["id"] == topic_id), None)
+    assert topic_after is not None
+    assert topic_after["mastery_level"] > 0.2
+    assert "mastery_level" in data
+    assert data["mastery_level"] == topic_after["mastery_level"]
