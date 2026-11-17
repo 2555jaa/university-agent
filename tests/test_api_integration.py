@@ -32,11 +32,25 @@ async def test_chat_first_ui_and_static_assets(async_client):
     assert styles.status_code == 200
     assert "#070b10" in styles.text
     assert "prefers-reduced-motion" in styles.text
+    assert "reasoning-accordion" in styles.text
+    assert "citation-badge" in styles.text
+    assert "chat-approval-card" in styles.text
+
+    # Also verify /static/styles.css alias
+    styles_alias = await async_client.get("/static/styles.css")
+    assert styles_alias.status_code == 200
+    assert "reasoning-accordion" in styles_alias.text
 
     script = await async_client.get("/static/app.js")
     assert script.status_code == 200
     assert 'api("/api/chat"' in script.text
     assert "/api/chat/history/" in script.text
+    assert "TextDecoder" in script.text
+    assert "reasoning-accordion" in script.text
+    assert "renderSourcesCard" in script.text
+    assert "renderApprovalCard" in script.text
+    assert "/api/memory/sessions" in script.text
+    assert "/api/security/approve/" in script.text
 
 
 @pytest.mark.asyncio
@@ -497,3 +511,55 @@ async def test_document_listing_with_subject_filter(async_client, test_app):
     res_filtered = await async_client.get("/api/documents?subject_id=NonExistentSubject")
     assert res_filtered.status_code == 200
     assert res_filtered.json() == []
+
+
+@pytest.mark.asyncio
+async def test_security_approval_endpoints_end_to_end(async_client, test_app):
+    """Verify security approval and rejection endpoints work end-to-end with validator and audit log."""
+    sec_val = test_app.state.services.security_validator
+
+    # 1. Generate approval request token on test_app's security validator
+    token = sec_val.generate_approval_token(
+        action="terminal_run",
+        params={"command": "pytest"}
+    )
+    assert isinstance(token, str) and len(token) > 10
+
+    # 2. Check pending list
+    pending_res = await async_client.get("/api/security/approvals")
+    assert pending_res.status_code == 200
+    pending_list = pending_res.json()
+    assert any(req["id"] == token for req in pending_list)
+
+    # 3. Approve via POST /api/security/approve/{token}
+    approve_res = await async_client.post(
+        f"/api/security/approve/{token}",
+        json={"reason": "Authorized by user"}
+    )
+    assert approve_res.status_code == 200
+    assert approve_res.json() == {"status": "approved", "approval_id": token}
+
+    # Verify status in validator
+    approval_obj = sec_val.get_approval(token)
+    assert approval_obj is not None
+    assert approval_obj.status.value == "approved"
+
+    # 4. Generate another token and test reject via POST /api/security/reject/{token}
+    token_reject = sec_val.generate_approval_token(
+        action="delete_file",
+        params={"path": "dangerous.py"}
+    )
+    reject_res = await async_client.post(
+        f"/api/security/reject/{token_reject}",
+        json={"reason": "Rejected by security policy"}
+    )
+    assert reject_res.status_code == 200
+    assert reject_res.json() == {"status": "rejected", "approval_id": token_reject}
+
+    approval_reject_obj = sec_val.get_approval(token_reject)
+    assert approval_reject_obj is not None
+    assert approval_reject_obj.status.value == "rejected"
+
+    # 5. Non-existent ID returns 404
+    bad_res = await async_client.post("/api/security/approve/nonexistent-id", json={})
+    assert bad_res.status_code == 404

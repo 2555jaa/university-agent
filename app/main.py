@@ -161,8 +161,17 @@ def create_app(custom_settings: Optional[Settings] = None) -> FastAPI:
 
     web_dir = Path(__file__).resolve().parent / "web"
     static_dir = web_dir / "static"
+
     if static_dir.exists():
         app_instance.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
+
+    @app_instance.get("/static/styles.css", include_in_schema=False)
+    async def styles_css_alias():
+        """Ensure /static/styles.css resolves cleanly to the stylesheet."""
+        css_file = static_dir / "styles.css"
+        if not css_file.exists():
+            css_file = static_dir / "app.css"
+        return FileResponse(css_file, media_type="text/css")
 
     @app_instance.get("/", include_in_schema=False)
     async def root():

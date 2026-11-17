@@ -11,6 +11,8 @@ from app.agent.orchestrator import (
     classify_academic_intent,
     extract_reasoning_path,
     extract_json_payload,
+    sanitize_tool_output,
+    parse_tool_calls,
 )
 from app.agent.prompts import (
     TUTORING_PROMPT,
@@ -21,6 +23,7 @@ from app.agent.prompts import (
 )
 from app.knowledge.rag_service import GroundedContext, ContextStatus
 from app.providers.base import LLMResponse
+from app.security.validator import ActionValidator
 
 
 def test_intent_classification_categorization():
@@ -366,7 +369,8 @@ async def test_process_query_prunes_long_chat_history_preserving_newest_and_syst
         req = AgentQueryRequest(
             session_id=sess_id,
             message="What is the final conclusion of our analysis?",
-            use_rag=False
+            use_rag=False,
+            use_tools=False
         )
         res = await agent.process_query(req)
 
@@ -486,3 +490,184 @@ async def test_evaluate_quiz_accurately_scores_four_questions(tmp_path):
     # Check topic mastery was updated via EMA: (0.5 * 0.7) + (0.75 * 0.3) = 0.35 + 0.225 = 0.575
     topic = await test_db.get_topic_by_name("cs_sys", "Core OS Concepts")
     assert topic["mastery_level"] == 0.575
+
+
+@pytest.mark.asyncio
+async def test_sanitize_tool_output_truncates_large_payload():
+    """Verify sanitize_tool_output safely truncates large tool outputs while leaving short outputs intact."""
+    short_text = "Operation completed successfully."
+    assert sanitize_tool_output(short_text, max_length=1500) == short_text
+
+    # Dict serialization
+    data = {"status": "success", "count": 10}
+    sanitized_dict = sanitize_tool_output(data, max_length=1500)
+    assert "success" in sanitized_dict
+
+    # 5,000 character output
+    large_payload = "A" * 5000
+    sanitized_large = sanitize_tool_output(large_payload, max_length=1500)
+    assert len(sanitized_large) <= 1500
+    assert "...[OUTPUT TRUNCATED DUE TO SIZE]..." in sanitized_large
+    assert sanitized_large.startswith("AAAA")
+    assert sanitized_large.endswith("AAAA")
+
+
+def test_parse_tool_calls_formats():
+    """Verify tool call parser supports XML, attributes, and JSON code block formats."""
+    # 1. Standard XML
+    xml_call = '<tool_call>\n{"name": "read_file", "arguments": {"path": "test.txt"}}\n</tool_call>'
+    parsed = parse_tool_calls(xml_call)
+    assert len(parsed) == 1
+    assert parsed[0]["name"] == "read_file"
+    assert parsed[0]["arguments"] == {"path": "test.txt"}
+
+    # 2. Alternate XML <tool>
+    alt_xml = '<tool>\n{"name": "list_directory", "arguments": {"path": "src"}}\n</tool>'
+    parsed = parse_tool_calls(alt_xml)
+    assert len(parsed) == 1
+    assert parsed[0]["name"] == "list_directory"
+    assert parsed[0]["arguments"] == {"path": "src"}
+
+    # 3. Attribute tag
+    attr_call = '<tool name="read_file">{"path": "config.json"}</tool>'
+    parsed = parse_tool_calls(attr_call)
+    assert len(parsed) == 1
+    assert parsed[0]["name"] == "read_file"
+    assert parsed[0]["arguments"] == {"path": "config.json"}
+
+    # 4. JSON markdown code block
+    json_block = '```json\n{"name": "run_safe_command", "arguments": {"command": "ls"}}\n```'
+    parsed = parse_tool_calls(json_block)
+    assert len(parsed) == 1
+    assert parsed[0]["name"] == "run_safe_command"
+    assert parsed[0]["arguments"] == {"command": "ls"}
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_tool_call_execution_and_followup(tmp_path):
+    """Verify orchestrator parses tool calls, executes the tool, appends role='tool', and triggers follow-up LLM generation."""
+    from app.memory.database import DatabaseManager
+    test_db = DatabaseManager(db_path=tmp_path / "agent_tool_test.db")
+    agent = AcademicAgent(db_instance=test_db)
+
+    # Mock tool call output from LLM in turn 1, and final grounded answer in turn 2
+    turn_1_response = LLMResponse(
+        content='<tool_call>\n{"name": "read_file", "arguments": {"path": "syllabus.txt"}}\n</tool_call>',
+        model="test-model",
+        provider="ollama"
+    )
+    turn_2_response = LLMResponse(
+        content="Based on syllabus.txt, Midterm Exam 1 is scheduled for October 24th.",
+        model="test-model",
+        provider="ollama"
+    )
+
+    with patch.object(agent.router, "route_and_generate", new_callable=AsyncMock) as mock_route, \
+         patch.object(agent, "execute_tool", new_callable=AsyncMock) as mock_exec:
+
+        mock_route.side_effect = [turn_1_response, turn_2_response]
+        mock_exec.return_value = {
+            "status": "success",
+            "path": "syllabus.txt",
+            "content": "Midterm Exam 1: October 24th. Final Exam: December 15th."
+        }
+
+        req = AgentQueryRequest(
+            message="When is the midterm exam?",
+            use_rag=False,
+            use_tools=True
+        )
+
+        res = await agent.process_query(req)
+
+        # 1. execute_tool was called for read_file
+        mock_exec.assert_awaited_once_with("read_file", {"path": "syllabus.txt"})
+
+        # 2. route_and_generate was called twice (initial turn + follow-up after tool execution)
+        assert mock_route.call_count == 2
+
+        # 3. Verify the messages passed into the second route_and_generate call
+        follow_up_messages = mock_route.call_args_list[1].kwargs["messages"]
+        roles = [m.role for m in follow_up_messages]
+        assert "assistant" in roles
+        assert "tool" in roles
+
+        tool_msg = next(m for m in follow_up_messages if m.role == "tool")
+        assert "Midterm Exam 1" in tool_msg.content
+
+        # 4. Final AgentResponse validation
+        assert res.status == "success"
+        assert res.reply == "Based on syllabus.txt, Midterm Exam 1 is scheduled for October 24th."
+        assert res.tool_calls is not None
+        assert len(res.tool_calls) == 1
+        assert res.tool_calls[0]["name"] == "read_file"
+        assert res.tool_calls[0]["result"]["status"] == "success"
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_halts_on_approval_required_tool(tmp_path):
+    """Verify orchestrator halts execution when a side-effect tool requires approval and no token is provided."""
+    from app.memory.database import DatabaseManager
+    test_db = DatabaseManager(db_path=tmp_path / "agent_approval_test.db")
+    agent = AcademicAgent(db_instance=test_db)
+
+    safe_target = str(agent.settings.DOCUMENTS_DIR / "solution.txt")
+    tool_call_text = (
+        f'<tool_call>\n'
+        f'{{"name": "write_file", "arguments": {{"path": "{safe_target}", "content": "answers"}}}}\n'
+        f'</tool_call>'
+    )
+    llm_res = LLMResponse(content=tool_call_text, model="test-model", provider="ollama")
+
+    with patch.object(agent.router, "route_and_generate", new_callable=AsyncMock) as mock_route:
+        mock_route.return_value = llm_res
+
+        req = AgentQueryRequest(
+            message="Write the exam answers to solution.txt",
+            use_rag=False,
+            use_tools=True
+        )
+
+        res = await agent.process_query(req)
+
+        # 1. route_and_generate was called only once (execution halted, no follow-up generation)
+        assert mock_route.call_count == 1
+
+        # 2. Response status is approval_required
+        assert res.status == "approval_required"
+        assert res.approval_required is not None
+        assert res.approval_required.get("status") == "approval_required"
+        assert "approval_id" in res.approval_required
+        assert isinstance(res.approval_required["approval_id"], str) and len(res.approval_required["approval_id"]) > 5
+
+        # 3. Tool call record was tracked
+        assert res.tool_calls is not None
+        assert len(res.tool_calls) == 1
+        assert res.tool_calls[0]["name"] == "write_file"
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_execute_code_approval_and_execution():
+    """Verify execute_code tool routes through approval check and sandbox execution."""
+    agent = AcademicAgent()
+
+    # Case 1: Without token -> approval_required
+    res_no_token = await agent.execute_tool(
+        name="execute_code",
+        arguments={"code": "print(2 + 2)", "language": "python"}
+    )
+    assert res_no_token["status"] == "approval_required"
+    assert res_no_token["action"] == "execute_code"
+    token = res_no_token["approval_id"]
+
+    # Approve token
+    ActionValidator.approve_action(token)
+
+    # Case 2: With valid token -> executes in sandbox
+    res_with_token = await agent.execute_tool(
+        name="execute_code",
+        arguments={"code": "print(2 + 2)", "language": "python", "approval_token": token}
+    )
+    assert res_with_token["status"] == "success"
+    assert "4" in res_with_token["stdout"]
+

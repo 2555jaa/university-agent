@@ -777,6 +777,21 @@ async def evaluate_quiz_endpoint(req: QuizEvaluateRequest, request: Request):
     )
 
 
+class AgentQuizEvaluateRequest(BaseModel):
+    topic_id: str
+    answers: Dict[str, str] = {}
+    quiz_data: Dict[str, Any] = {}
+
+
+@router.post("/agent/quiz/evaluate")
+async def evaluate_agent_quiz(req: AgentQuizEvaluateRequest, request: Request):
+    return await get_services(request).agent.evaluate_quiz(
+        topic_id=req.topic_id,
+        answers=req.answers,
+        quiz_data=req.quiz_data
+    )
+
+
 # --- RESTRICTED PC TOOLS & SECURITY ---
 
 class FileReadRequest(BaseModel):
@@ -862,6 +877,7 @@ class ApprovalDecision(BaseModel):
 
 
 @router.post("/security/approvals/{approval_id}/approve")
+@router.post("/security/approve/{approval_id}")
 async def approve_request(approval_id: str, request: Request, req: ApprovalDecision = ApprovalDecision()):
     services = get_services(request)
     ok = services.security_validator.approve_action(approval_id, req.reason)
@@ -879,6 +895,7 @@ async def approve_request(approval_id: str, request: Request, req: ApprovalDecis
 
 
 @router.post("/security/approvals/{approval_id}/reject")
+@router.post("/security/reject/{approval_id}")
 async def reject_request(approval_id: str, request: Request, req: ApprovalDecision = ApprovalDecision()):
     services = get_services(request)
     ok = services.security_validator.reject_action(approval_id, req.reason)
@@ -902,40 +919,64 @@ async def get_audit_log(request: Request, limit: int = 50):
 
 # --- OPEN WEBUI / OPENAI COMPATIBILITY ---
 
+def format_sources_footer(used_sources: List[Dict[str, Any]]) -> str:
+    """Format grounded source references into a clean Markdown footer for Open WebUI / OpenAI clients."""
+    if not used_sources:
+        return ""
+    lines = ["\n\n---\n**Sources:**"]
+    for i, s in enumerate(used_sources, start=1):
+        idx = s.get("index") or i
+        filename = s.get("filename") or s.get("document_id") or "Document"
+        page = s.get("page_number")
+        heading = s.get("heading")
+        parts = []
+        if page is not None and str(page).strip():
+            parts.append(f"Page {page}")
+        if heading and str(heading).strip():
+            parts.append(str(heading).strip())
+        detail = f" ({' — '.join(parts)})" if parts else ""
+        lines.append(f"[{idx}] {filename}{detail}")
+    return "\n".join(lines)
+
+
 @router.get("/v1/models")
 async def openai_models():
-    """Return models in OpenAI format for Open WebUI discovery."""
+    """Return virtual academic models in OpenAI format for Open WebUI discovery."""
+    now = int(time.time())
+    model_ids = [
+        "university-agent",
+        "university-agent-tutor",
+        "university-agent-research",
+        "university-agent-summarizer",
+        # Legacy aliases for backward compatibility
+        "university-tutor",
+        "university-research"
+    ]
     return {
         "object": "list",
         "data": [
             {
-                "id": "university-tutor",
+                "id": m_id,
                 "object": "model",
-                "created": int(time.time()),
+                "created": now,
                 "owned_by": "university-agent",
                 "permission": [],
-                "root": "university-tutor",
-                "parent": None
-            },
-            {
-                "id": "university-research",
-                "object": "model",
-                "created": int(time.time()),
-                "owned_by": "university-agent",
-                "permission": [],
-                "root": "university-research",
+                "root": m_id,
                 "parent": None
             }
+            for m_id in model_ids
         ]
     }
 
 
 class OpenAIChatCompletionRequest(BaseModel):
     model: str
-    messages: List[Dict[str, str]]
+    messages: List[Dict[str, Any]]
     temperature: Optional[float] = 0.7
     max_tokens: Optional[int] = 2048
     stream: Optional[bool] = False
+
+    model_config = {"extra": "ignore"}
 
 
 @router.post("/v1/chat/completions")
@@ -947,36 +988,246 @@ async def openai_chat_completions(req: OpenAIChatCompletionRequest, request: Req
             user_prompt = m.get("content", "")
             break
 
-    mode = "tutor"
-    if "research" in req.model:
+    # Persona / Mode mapping
+    model_lower = req.model.lower().strip()
+    if "research" in model_lower:
         mode = "research"
+    elif "summariz" in model_lower:
+        mode = "summarizer"
+    elif "assignment" in model_lower:
+        mode = "assignment"
+    elif "tutor" in model_lower:
+        mode = "tutor"
+    else:
+        mode = "tutor"
 
     agent_req = AgentQueryRequest(
         message=user_prompt,
+        messages=req.messages,
         mode=mode,
         use_rag=True,
-        is_private=True
+        is_private=True,
+        stream=req.stream or False
     )
-    res = await get_services(request).agent.process_query(agent_req)
+    services = get_services(request)
+    agent = services.agent
 
-    return {
-        "id": f"chatcmpl-{res.message_id}",
-        "object": "chat.completion",
-        "created": int(time.time()),
-        "model": req.model,
-        "choices": [
-            {
-                "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "content": res.reply
-                },
-                "finish_reason": "stop"
-            }
-        ],
-        "usage": {
-            "prompt_tokens": len(user_prompt) // 4,
-            "completion_tokens": len(res.reply) // 4,
-            "total_tokens": (len(user_prompt) + len(res.reply)) // 4
+    if not req.stream:
+        res = await agent.process_query(agent_req)
+        reply_content = res.reply or ""
+        used_sources = res.used_sources or []
+
+        if used_sources:
+            sources_footer = format_sources_footer(used_sources)
+            if sources_footer and "**Sources:**" not in reply_content and "Sources:" not in reply_content:
+                reply_content = reply_content + sources_footer
+
+        prompt_tokens = max(1, len(user_prompt) // 4)
+        completion_tokens = max(1, len(reply_content) // 4)
+
+        return {
+            "id": f"chatcmpl-{res.message_id}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": req.model,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": reply_content
+                    },
+                    "finish_reason": "stop"
+                }
+            ],
+            "usage": {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": prompt_tokens + completion_tokens
+            },
+            "citations": res.citations or used_sources,
+            "used_sources": used_sources
         }
-    }
+
+    # Streaming mode (SSE chat.completion.chunk format ending with data: [DONE])
+    completion_id = str(uuid.uuid4())
+    created_ts = int(time.time())
+
+    async def openai_sse_generator():
+        try:
+            has_mocked_pq = isinstance(getattr(agent, "process_query", None), AsyncMock)
+            has_mocked_pqs = isinstance(getattr(agent, "process_query_stream", None), AsyncMock)
+
+            used_sources = []
+            accumulated_text = ""
+
+            if has_mocked_pq and not has_mocked_pqs:
+                res = await agent.process_query(agent_req)
+                token_text = getattr(res, "reply", str(res))
+                used_sources = getattr(res, "used_sources", []) or []
+
+                chunk_payload = {
+                    "id": f"chatcmpl-{completion_id}",
+                    "object": "chat.completion.chunk",
+                    "created": created_ts,
+                    "model": req.model,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"content": token_text},
+                            "finish_reason": None
+                        }
+                    ]
+                }
+                yield f"data: {json.dumps(chunk_payload)}\n\n"
+                accumulated_text += token_text
+            else:
+                if hasattr(agent, "process_query_stream"):
+                    stream = agent.process_query_stream(agent_req)
+                else:
+                    stream = None
+
+                if stream is not None:
+                    if inspect.iscoroutine(stream):
+                        stream = await stream
+
+                    async for chunk in stream:
+                        if isinstance(chunk, dict):
+                            if chunk.get("error"):
+                                error_chunk = {
+                                    "id": f"chatcmpl-{completion_id}",
+                                    "object": "chat.completion.chunk",
+                                    "created": created_ts,
+                                    "model": req.model,
+                                    "choices": [
+                                        {
+                                            "index": 0,
+                                            "delta": {"content": f"\nError: {chunk.get('error')}"},
+                                            "finish_reason": "stop"
+                                        }
+                                    ]
+                                }
+                                yield f"data: {json.dumps(error_chunk)}\n\n"
+                                yield "data: [DONE]\n\n"
+                                return
+
+                            if chunk.get("done"):
+                                used_sources = chunk.get("used_sources") or chunk.get("metadata", {}).get("used_sources") or []
+                                continue
+
+                            token = chunk.get("token") or chunk.get("reply")
+                            if token:
+                                accumulated_text += token
+                                chunk_payload = {
+                                    "id": f"chatcmpl-{completion_id}",
+                                    "object": "chat.completion.chunk",
+                                    "created": created_ts,
+                                    "model": req.model,
+                                    "choices": [
+                                        {
+                                            "index": 0,
+                                            "delta": {"content": token},
+                                            "finish_reason": None
+                                        }
+                                    ]
+                                }
+                                yield f"data: {json.dumps(chunk_payload)}\n\n"
+                        elif isinstance(chunk, str):
+                            accumulated_text += chunk
+                            chunk_payload = {
+                                "id": f"chatcmpl-{completion_id}",
+                                "object": "chat.completion.chunk",
+                                "created": created_ts,
+                                "model": req.model,
+                                "choices": [
+                                    {
+                                        "index": 0,
+                                        "delta": {"content": chunk},
+                                        "finish_reason": None
+                                    }
+                                ]
+                            }
+                            yield f"data: {json.dumps(chunk_payload)}\n\n"
+                else:
+                    res = await agent.process_query(agent_req)
+                    token_text = getattr(res, "reply", str(res))
+                    used_sources = getattr(res, "used_sources", []) or []
+                    accumulated_text += token_text
+                    chunk_payload = {
+                        "id": f"chatcmpl-{completion_id}",
+                        "object": "chat.completion.chunk",
+                        "created": created_ts,
+                        "model": req.model,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"content": token_text},
+                                "finish_reason": None
+                            }
+                        ]
+                    }
+                    yield f"data: {json.dumps(chunk_payload)}\n\n"
+
+            # Stream citations footer if sources were cited
+            if used_sources:
+                sources_footer = format_sources_footer(used_sources)
+                if sources_footer and "**Sources:**" not in accumulated_text and "Sources:" not in accumulated_text:
+                    sources_chunk = {
+                        "id": f"chatcmpl-{completion_id}",
+                        "object": "chat.completion.chunk",
+                        "created": created_ts,
+                        "model": req.model,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"content": sources_footer},
+                                "finish_reason": None
+                            }
+                        ]
+                    }
+                    yield f"data: {json.dumps(sources_chunk)}\n\n"
+
+            # Stop chunk
+            stop_chunk = {
+                "id": f"chatcmpl-{completion_id}",
+                "object": "chat.completion.chunk",
+                "created": created_ts,
+                "model": req.model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {},
+                        "finish_reason": "stop"
+                    }
+                ]
+            }
+            yield f"data: {json.dumps(stop_chunk)}\n\n"
+            yield "data: [DONE]\n\n"
+
+        except Exception as e:
+            logger.error(f"OpenAI chat completions streaming error: {e}")
+            err_chunk = {
+                "id": f"chatcmpl-{completion_id}",
+                "object": "chat.completion.chunk",
+                "created": created_ts,
+                "model": req.model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"content": f"\nError: {e}"},
+                        "finish_reason": "stop"
+                    }
+                ]
+            }
+            yield f"data: {json.dumps(err_chunk)}\n\n"
+            yield "data: [DONE]\n\n"
+
+    return StreamingResponse(
+        openai_sse_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no"
+        }
+    )

@@ -2,6 +2,7 @@
 
 import asyncio
 from enum import Enum
+import inspect
 import json
 import logging
 import re
@@ -32,6 +33,10 @@ from app.memory.database import db
 from app.providers.base import LLMMessage, LLMResponse
 from app.providers.router import router, TaskComplexity
 from app.security.audit import audit_logger
+from app.security.validator import ActionValidator
+from app.tools.terminal_tools import TerminalTools
+from app.tools.filesystem_tools import FilesystemTools
+from app.security.sandbox import execute_code, get_sandbox_tool_schemas
 
 logger = logging.getLogger("university_agent.agent.orchestrator")
 
@@ -193,6 +198,176 @@ def extract_json_payload(raw_response: str) -> Dict[str, Any]:
     return data
 
 
+def sanitize_tool_output(output: Any, max_length: int = 1500) -> str:
+    """Sanitize and truncate tool execution outputs to protect LLM context windows."""
+    if output is None:
+        return ""
+    if isinstance(output, (dict, list)):
+        text = json.dumps(output, indent=2 if len(str(output)) < 300 else None)
+    else:
+        text = str(output)
+
+    if len(text) <= max_length:
+        return text
+
+    marker = "\n...[OUTPUT TRUNCATED DUE TO SIZE]...\n"
+    available = max_length - len(marker)
+    if available <= 0:
+        return text[:max_length] + marker.strip()
+
+    half = available // 2
+    head = text[:half]
+    tail = text[-half:]
+    return head + marker + tail
+
+
+def parse_tool_calls(text: str) -> List[Dict[str, Any]]:
+    """Parse tool calls from LLM generation text across XML and JSON formats."""
+    if not text or not isinstance(text, str):
+        return []
+
+    calls: List[Dict[str, Any]] = []
+
+    # 1. XML <tool_call>...</tool_call> or <tool>...</tool>
+    xml_patterns = [
+        r'<\s*tool_call(?:[^>]*)>(.*?)<\s*/\s*tool_call\s*>',
+        r'<\s*tool(?:[^>]*)>(.*?)<\s*/\s*tool\s*>',
+    ]
+    for pattern in xml_patterns:
+        for match in re.finditer(pattern, text, re.DOTALL | re.IGNORECASE):
+            raw_block = match.group(1).strip()
+            # Try parsing direct JSON
+            try:
+                data = json.loads(raw_block)
+                if isinstance(data, dict):
+                    name = data.get("name") or data.get("tool") or data.get("action")
+                    args = data.get("arguments") or data.get("params") or data.get("parameters") or {}
+                    if not args and any(k not in ("name", "tool", "action") for k in data.keys()):
+                        args = {k: v for k, v in data.items() if k not in ("name", "tool", "action")}
+                    if name:
+                        calls.append({"name": str(name), "arguments": args, "raw": raw_block})
+                        continue
+            except json.JSONDecodeError:
+                pass
+
+            # Try finding outermost { ... } inside the tag
+            fb = raw_block.find("{")
+            lb = raw_block.rfind("}")
+            if fb != -1 and lb > fb:
+                try:
+                    data = json.loads(raw_block[fb:lb+1])
+                    if isinstance(data, dict):
+                        name = data.get("name") or data.get("tool") or data.get("action")
+                        args = data.get("arguments") or data.get("params") or data.get("parameters") or {}
+                        if not args and any(k not in ("name", "tool", "action") for k in data.keys()):
+                            args = {k: v for k, v in data.items() if k not in ("name", "tool", "action")}
+                        if name:
+                            calls.append({"name": str(name), "arguments": args, "raw": raw_block})
+                            continue
+                except json.JSONDecodeError:
+                    pass
+
+    # 2. Tag attributes: <tool name="read_file">{"path": "notes.txt"}</tool>
+    attr_patterns = [
+        r'<\s*tool(?:_call)?\s+name=["\']([^"\']+)["\']\s*>(.*?)<\s*/\s*tool(?:_call)?\s*>'
+    ]
+    for pattern in attr_patterns:
+        for match in re.finditer(pattern, text, re.DOTALL | re.IGNORECASE):
+            name = match.group(1).strip()
+            raw_content = match.group(2).strip()
+            args = {}
+            if raw_content:
+                try:
+                    data = json.loads(raw_content)
+                    if isinstance(data, dict):
+                        args = data
+                except Exception:
+                    args = {"input": raw_content}
+            calls.append({"name": name, "arguments": args, "raw": match.group(0)})
+
+    # 3. Top-level JSON or Markdown code fence
+    if not calls:
+        if "```json" in text or "```tool" in text:
+            block = text.split("```", 1)[1]
+            if "```" in block:
+                cand = block.split("```", 1)[0].replace("json", "").replace("tool", "").strip()
+                try:
+                    data = json.loads(cand)
+                    if isinstance(data, dict):
+                        if "tool_calls" in data and isinstance(data["tool_calls"], list):
+                            for tc in data["tool_calls"]:
+                                calls.append({
+                                    "name": tc.get("name") or tc.get("function", {}).get("name"),
+                                    "arguments": tc.get("arguments") or tc.get("function", {}).get("arguments", {}),
+                                    "raw": cand
+                                })
+                        elif data.get("name") or data.get("tool"):
+                            name = data.get("name") or data.get("tool")
+                            args = data.get("arguments") or data.get("parameters", {})
+                            calls.append({"name": name, "arguments": args, "raw": cand})
+                except json.JSONDecodeError:
+                    pass
+        elif "{" in text and "}" in text:
+            fb = text.find("{")
+            lb = text.rfind("}")
+            if fb != -1 and lb > fb:
+                try:
+                    data = json.loads(text[fb:lb+1])
+                    if isinstance(data, dict):
+                        if "tool_calls" in data and isinstance(data["tool_calls"], list):
+                            for tc in data["tool_calls"]:
+                                calls.append({
+                                    "name": tc.get("name") or tc.get("function", {}).get("name"),
+                                    "arguments": tc.get("arguments") or tc.get("function", {}).get("arguments", {}),
+                                    "raw": text[fb:lb+1]
+                                })
+                        elif data.get("name") in {"read_file", "write_file", "list_directory", "delete_file", "run_safe_command", "execute_code"}:
+                            calls.append({
+                                "name": data.get("name"),
+                                "arguments": data.get("arguments", {}),
+                                "raw": text[fb:lb+1]
+                            })
+                except json.JSONDecodeError:
+                    pass
+
+    # Deduplicate calls
+    unique_calls: List[Dict[str, Any]] = []
+    seen = set()
+    for c in calls:
+        key = (c.get("name"), json.dumps(c.get("arguments"), sort_keys=True))
+        if key not in seen:
+            seen.add(key)
+            unique_calls.append(c)
+
+    return unique_calls
+
+
+def format_tools_system_prompt(tool_schemas: List[Dict[str, Any]]) -> str:
+    """Format tool schemas into system prompt instructions for LLM tool invocation."""
+    if not tool_schemas:
+        return ""
+    tools_summary = []
+    for t in tool_schemas:
+        fn = t.get("function", {})
+        name = fn.get("name", "")
+        desc = fn.get("description", "")
+        params = fn.get("parameters", {}).get("properties", {})
+        param_list = ", ".join(f"{k}: {v.get('type', 'any')}" for k, v in params.items())
+        tools_summary.append(f"- {name}({param_list}): {desc}")
+
+    prompt_part = (
+        "\n\n<tools>\n"
+        "You have access to the following academic and system tools:\n"
+        + "\n".join(tools_summary)
+        + "\n\nTo call a tool, output the invocation formatted inside <tool_call> tags:\n"
+        '<tool_call>\n{"name": "tool_name", "arguments": {"param1": "val1"}}\n</tool_call>\n'
+        "When the tool finishes, its result will be provided so you can give the final answer.\n"
+        "For destructive or side-effect tools (write_file, execute_code, run_safe_command, delete_file), human approval is required if no approval_token is supplied.\n"
+        "</tools>\n"
+    )
+    return prompt_part
+
+
 def prune_chat_history(
     history: List[Dict[str, Any]],
     system_prompt: str,
@@ -223,7 +398,7 @@ def prune_chat_history(
     for h in reversed(history):
         content = h.get("content", "")
         role = h.get("role", "user")
-        if role not in ("user", "assistant", "system"):
+        if role not in ("user", "assistant", "system", "tool"):
             continue
         msg_tokens = token_est(content)
         if accumulated_history_tokens + msg_tokens <= available_history_budget:
@@ -252,6 +427,7 @@ class AgentQueryRequest(BaseModel):
     subject_id: Optional[str] = None
     topic_id: Optional[str] = None
     use_rag: bool = True
+    use_tools: bool = True
     is_private: bool = True
     complexity: str = "low"  # "low", "medium", "high"
     stream: bool = True
@@ -287,6 +463,9 @@ class AgentResponse(BaseModel):
     quiz_evaluated: Optional[Dict[str, Any]] = None
     intent: Optional[str] = None
     reasoning_path: Optional[str] = None
+    tool_calls: Optional[List[Dict[str, Any]]] = None
+    status: str = "success"
+    approval_required: Optional[Dict[str, Any]] = None
 
 
 class AcademicAgent:
@@ -314,6 +493,107 @@ class AcademicAgent:
     def extract_reasoning_path(self, text: str) -> Tuple[str, Optional[str]]:
         """Extract <think> tags from text."""
         return extract_reasoning_path(text)
+
+    def get_tool_schemas(self) -> List[Dict[str, Any]]:
+        """Return combined OpenAI function schemas for Terminal, Filesystem, and Sandbox tools."""
+        schemas = []
+        try:
+            schemas.extend(TerminalTools.get_tool_schemas())
+        except Exception as e:
+            logger.warning(f"Failed to load terminal tool schemas: {e}")
+
+        try:
+            schemas.extend(FilesystemTools.get_tool_schemas())
+        except Exception as e:
+            logger.warning(f"Failed to load filesystem tool schemas: {e}")
+
+        try:
+            schemas.extend(get_sandbox_tool_schemas())
+        except Exception as e:
+            logger.warning(f"Failed to load sandbox tool schemas: {e}")
+
+        return schemas
+
+    def sanitize_tool_output(self, output: Any, max_length: int = 1500) -> str:
+        """Sanitize and truncate tool execution outputs to protect LLM context windows."""
+        return sanitize_tool_output(output, max_length=max_length)
+
+    def parse_tool_calls(self, text: str) -> List[Dict[str, Any]]:
+        """Parse tool calls from LLM generation text."""
+        return parse_tool_calls(text)
+
+    async def execute_tool(self, name: str, arguments: Union[Dict[str, Any], str, None]) -> Dict[str, Any]:
+        """Route tool call to appropriate security-hardened tool engine."""
+        name = name.split(".")[-1].lower().strip()
+        if isinstance(arguments, str):
+            try:
+                arguments = json.loads(arguments)
+            except Exception:
+                arguments = {"input": arguments}
+        args = dict(arguments or {})
+
+        # Parse stringified json args if necessary
+        for k, v in list(args.items()):
+            if isinstance(v, str) and (v.startswith("{") or v.startswith("[")):
+                try:
+                    args[k] = json.loads(v)
+                except Exception:
+                    pass
+
+        token = args.get("approval_token") or args.get("approval_id")
+
+        if name == "read_file":
+            path = args.get("path") or args.get("file_path") or ""
+            return FilesystemTools.read_file(path=path)
+
+        elif name == "write_file":
+            path = args.get("path") or args.get("file_path") or ""
+            content = args.get("content", "")
+            return FilesystemTools.write_file(path=path, content=content, approval_token=token)
+
+        elif name == "list_directory":
+            path = args.get("path") or args.get("dir_path") or "."
+            return FilesystemTools.list_directory(path=path)
+
+        elif name == "delete_file":
+            path = args.get("path") or args.get("file_path") or ""
+            return FilesystemTools.delete_file(file_path=path, approval_token=token)
+
+        elif name in ("run_safe_command", "terminal_run", "run_command"):
+            cmd = args.get("command") or args.get("command_str") or args.get("cmd") or ""
+            timeout = float(args.get("timeout", 5.0))
+            res = TerminalTools.run_safe_command(command_str=cmd, approval_token=token, timeout=timeout)
+            if inspect.isawaitable(res):
+                res = await res
+            return res
+
+        elif name in ("execute_code", "run_code"):
+            code = args.get("code") or args.get("script", "")
+            language = args.get("language", "python")
+            if not token:
+                req_id = ActionValidator.generate_approval_token(
+                    action_name="execute_code",
+                    params={"code": code}
+                )
+                return {
+                    "status": "approval_required",
+                    "action": "execute_code",
+                    "approval_id": req_id,
+                    "message": f"Executing code in sandbox requires explicit approval. Submit approval ID '{req_id}'."
+                }
+            ok, err = ActionValidator.consume_approval_token(token, "execute_code", code=code)
+            if not ok:
+                return {
+                    "status": "blocked",
+                    "error": f"Action approval rejected: {err}"
+                }
+            return execute_code(code=code, language=language)
+
+        else:
+            return {
+                "status": "error",
+                "error": f"Unknown tool '{name}'."
+            }
 
     def prune_history(
         self,
@@ -350,7 +630,7 @@ class AcademicAgent:
             return DEFAULT_RESEARCH_PROMPT
         elif mode == "assignment":
             return ASSIGNMENT_GUARDRAIL_PROMPT
-        elif mode == "assistant":
+        elif mode in ("assistant", "summarizer"):
             return SUMMARIZATION_PROMPT
         return DEFAULT_RESEARCH_PROMPT
 
@@ -387,6 +667,10 @@ class AcademicAgent:
 
         # 2. Build LLM Conversation Context with dynamically selected persona
         system_prompt = self._get_system_prompt(mode=req.mode, intent=intent)
+        if getattr(req, "use_tools", True):
+            tool_schemas = self.get_tool_schemas()
+            system_prompt += format_tools_system_prompt(tool_schemas)
+
         if grounded_ctx.has_relevant_info:
             system_prompt += (
                 "\n\n<retrieved_context>\n"
@@ -446,6 +730,116 @@ class AcademicAgent:
             provider_name = "none"
             is_fallback = True
 
+        executed_tool_calls: List[Dict[str, Any]] = []
+
+        # Tool orchestration loop: detect tool calls, execute them, append results, and re-prompt LLM
+        if getattr(req, "use_tools", True) and not is_fallback:
+            max_tool_iterations = 5
+            for _ in range(max_tool_iterations):
+                parsed_calls = self.parse_tool_calls(reply_text)
+                if not parsed_calls:
+                    break
+
+                halted_for_approval = False
+                approval_result = None
+
+                # Append assistant's turn with tool call to context
+                messages.append(LLMMessage(role="assistant", content=reply_text))
+
+                for tc in parsed_calls:
+                    t_name = tc.get("name", "")
+                    t_args = tc.get("arguments", {})
+                    tool_res = await self.execute_tool(t_name, t_args)
+                    executed_tool_calls.append({
+                        "name": t_name,
+                        "arguments": t_args,
+                        "result": tool_res
+                    })
+
+                    if isinstance(tool_res, dict) and tool_res.get("status") == "approval_required":
+                        halted_for_approval = True
+                        approval_result = tool_res
+                        break
+
+                    sanitized_output = self.sanitize_tool_output(tool_res, max_length=1500)
+                    messages.append(LLMMessage(role="tool", content=sanitized_output))
+
+                if halted_for_approval and approval_result:
+                    # Immediately halt execution and return approval_required state
+                    user_metadata = {"intent": intent.value if intent else None}
+                    await self.db.save_message(
+                        message_id=str(uuid.uuid4()),
+                        session_id=session_id,
+                        role="user",
+                        content=req.message,
+                        mode=req.mode,
+                        metadata=user_metadata
+                    )
+                    approval_msg = (
+                        f"Action '{approval_result.get('action') or t_name}' requires approval. "
+                        f"Approval ID: {approval_result.get('approval_id')}"
+                    )
+                    assistant_metadata = {
+                        "status": "approval_required",
+                        "approval_required": approval_result,
+                        "tool_calls": executed_tool_calls,
+                        "intent": intent.value if intent else None
+                    }
+                    await self.db.save_message(
+                        message_id=msg_id,
+                        session_id=session_id,
+                        role="assistant",
+                        content=approval_msg,
+                        mode=req.mode,
+                        metadata=assistant_metadata
+                    )
+                    self.audit.log_event(
+                        event_type="tool_execution",
+                        action="approval_required",
+                        details={
+                            "session_id": session_id,
+                            "tool_calls": executed_tool_calls,
+                            "approval_result": approval_result
+                        },
+                        risk_level="medium",
+                        status="pending_approval"
+                    )
+                    return AgentResponse(
+                        session_id=session_id,
+                        message_id=msg_id,
+                        reply=approval_msg,
+                        mode=req.mode,
+                        model=model_name,
+                        provider=provider_name,
+                        is_fallback=is_fallback,
+                        citations=[],
+                        used_sources=[],
+                        has_grounding=grounded_ctx.has_relevant_info,
+                        intent=intent.value if intent else None,
+                        reasoning_path=None,
+                        tool_calls=executed_tool_calls,
+                        status="approval_required",
+                        approval_required=approval_result
+                    )
+
+                # Re-prompt LLM with the tool outputs
+                try:
+                    async with self._inference_semaphore:
+                        llm_res = await self.router.route_and_generate(
+                            messages=messages,
+                            complexity=complexity_enum,
+                            is_private=req.is_private,
+                            temperature=0.6 if req.mode == "research" else 0.7
+                        )
+                    reply_text = llm_res.content
+                    model_name = llm_res.model
+                    provider_name = llm_res.provider
+                    is_fallback = llm_res.is_fallback
+                except Exception as e:
+                    logger.error(f"Inference error during tool follow-up generation: {e}")
+                    reply_text = f"Tool executed successfully, but follow-up generation encountered an error: {e}"
+                    break
+
         # Extract reasoning path (<think>...</think> tags) before citation validation
         reply_text, reasoning_path = self.extract_reasoning_path(reply_text)
 
@@ -470,7 +864,8 @@ class AcademicAgent:
         assistant_metadata = {
             "used_sources": used_sources,
             "reasoning_path": reasoning_path,
-            "intent": intent.value if intent else None
+            "intent": intent.value if intent else None,
+            "tool_calls": executed_tool_calls if executed_tool_calls else None
         }
         await self.db.save_message(
             message_id=msg_id,
@@ -488,11 +883,12 @@ class AcademicAgent:
             details={
                 "session_id": session_id,
                 "mode": req.mode,
-                "intent": intent.value,
+                "intent": intent.value if intent else None,
                 "model": model_name,
                 "provider": provider_name,
                 "citations_count": len(used_sources),
-                "has_reasoning": reasoning_path is not None
+                "has_reasoning": reasoning_path is not None,
+                "tool_calls_count": len(executed_tool_calls)
             },
             risk_level="low",
             status="success"
@@ -509,8 +905,10 @@ class AcademicAgent:
             citations=used_sources,
             used_sources=used_sources,
             has_grounding=grounded_ctx.has_relevant_info,
-            intent=intent.value,
-            reasoning_path=reasoning_path
+            intent=intent.value if intent else None,
+            reasoning_path=reasoning_path,
+            tool_calls=executed_tool_calls if executed_tool_calls else None,
+            status="success"
         )
 
     async def process_query_stream(
@@ -549,6 +947,10 @@ class AcademicAgent:
 
         # 2. Build LLM Conversation Context with dynamically selected persona
         system_prompt = self._get_system_prompt(mode=req.mode, intent=intent)
+        if getattr(req, "use_tools", True):
+            tool_schemas = self.get_tool_schemas()
+            system_prompt += format_tools_system_prompt(tool_schemas)
+
         if grounded_ctx.has_relevant_info:
             system_prompt += (
                 "\n\n<retrieved_context>\n"

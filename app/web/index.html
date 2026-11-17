@@ -122,7 +122,18 @@
           <label class="secondary-button" for="library-file-input">Choose file</label>
           <input id="library-file-input" type="file" accept=".pdf,.docx,.doc,.txt,.md" hidden>
         </div>
-        <div class="library-toolbar"><span class="section-label">INDEXED DOCUMENTS</span><button class="text-button" id="refresh-documents" type="button">Refresh</button></div>
+        <div class="library-toolbar">
+          <div class="library-toolbar-left">
+            <span class="section-label">INDEXED DOCUMENTS</span>
+            <div class="filter-group">
+              <label for="doc-subject-filter" class="filter-label">Subject:</label>
+              <select id="doc-subject-filter" class="filter-select">
+                <option value="">All Subjects</option>
+              </select>
+            </div>
+          </div>
+          <button class="text-button" id="refresh-documents" type="button">Refresh</button>
+        </div>
         <div class="document-list" id="document-list"><div class="loading-row">Loading your library…</div></div>
         <p class="view-note" id="library-note"></p>
       </section>
@@ -131,10 +142,73 @@
         <div class="content-heading"><p class="eyebrow">YOUR STUDY SPACE</p><h1 id="learning-heading">Learning progress</h1><p>A quiet snapshot of your recorded learning activity.</p></div>
         <div class="learning-stats" id="learning-stats"><div class="loading-row">Loading your progress…</div></div>
         <div class="learning-columns">
-          <section class="subpanel"><div class="panel-heading"><h2>Topics</h2><span class="panel-mark" aria-hidden="true">01</span></div><div id="topic-list" class="topic-list"></div></section>
-          <section class="subpanel"><div class="panel-heading"><h2>Study tasks</h2><span class="panel-mark" aria-hidden="true">02</span></div><div id="task-list" class="task-list"></div></section>
+          <section class="subpanel">
+            <div class="panel-heading">
+              <h2>Topics & Mastery</h2>
+              <span class="panel-mark" aria-hidden="true">01</span>
+            </div>
+            <div class="panel-subcontrols">
+              <select id="topic-subject-filter" class="filter-select small-select">
+                <option value="">All Subjects</option>
+              </select>
+            </div>
+            <div id="topic-list" class="topic-list"></div>
+          </section>
+
+          <section class="subpanel">
+            <div class="panel-heading">
+              <h2>Study tasks</h2>
+              <span class="panel-mark" aria-hidden="true">02</span>
+            </div>
+            <div class="task-filter-tabs" id="task-filter-tabs">
+              <button type="button" class="tab-btn active" data-task-filter="all">All</button>
+              <button type="button" class="tab-btn" data-task-filter="upcoming">Upcoming</button>
+              <button type="button" class="tab-btn" data-task-filter="overdue">Overdue</button>
+            </div>
+            <form id="new-task-form" class="inline-create-form">
+              <input type="text" id="task-title-input" placeholder="New study task…" required>
+              <input type="date" id="task-due-date">
+              <button type="submit" class="secondary-button small-btn">Add</button>
+            </form>
+            <div id="task-list" class="task-list"></div>
+          </section>
+
+          <section class="subpanel">
+            <div class="panel-heading">
+              <h2>Study goals</h2>
+              <span class="panel-mark" aria-hidden="true">03</span>
+            </div>
+            <form id="new-goal-form" class="inline-create-form">
+              <input type="text" id="goal-title-input" placeholder="New study goal…" required>
+              <input type="date" id="goal-target-date">
+              <button type="submit" class="secondary-button small-btn">Add Goal</button>
+            </form>
+            <div id="goal-list" class="goal-list"></div>
+          </section>
         </div>
       </section>
+
+      <!-- Interactive Quiz Modal -->
+      <div class="modal-overlay" id="quiz-modal" hidden>
+        <div class="modal-dialog quiz-dialog" role="dialog" aria-modal="true" aria-labelledby="quiz-modal-title">
+          <div class="modal-header">
+            <div>
+              <p class="eyebrow" id="quiz-modal-eyebrow">TOPIC MASTERY QUIZ</p>
+              <h2 id="quiz-modal-title">Take Quiz</h2>
+            </div>
+            <button class="icon-button modal-close" id="quiz-modal-close" type="button" aria-label="Close quiz modal">✕</button>
+          </div>
+          <div class="quiz-modal-body" id="quiz-modal-body">
+            <div id="quiz-loading" class="loading-row" hidden>Generating questions from your course materials…</div>
+            <div id="quiz-questions-container" class="quiz-questions-container"></div>
+            <div id="quiz-results" class="quiz-results" hidden></div>
+          </div>
+          <div class="modal-footer" id="quiz-modal-footer">
+            <button class="secondary-button" id="quiz-cancel-btn" type="button">Close</button>
+            <button class="primary-button" id="quiz-submit-btn" type="button">Submit Answers</button>
+          </div>
+        </div>
+      </div>
 
       <section class="view content-view" id="settings-view" hidden aria-labelledby="settings-heading">
         <div class="content-heading"><p class="eyebrow">LOCAL SYSTEM</p><h1 id="settings-heading">System & approvals</h1><p>Live service information and actions awaiting your decision.</p></div>
