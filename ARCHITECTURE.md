@@ -312,7 +312,7 @@ When streaming is enabled (`stream=true`), `AcademicAgent.process_query_stream()
 ```json
 data: {"type": "reasoning", "delta": "Let us break down the mathematical definition..."}
 data: {"type": "token", "delta": "A graph is bipartite if and only if..."}
-data: {"type": "meta", "intent": "tutor", "model": "qwen2.5:1.5b", "used_sources": [...]}
+data: {"type": "meta", "intent": "tutor", "model": "qwen2.5:3b", "used_sources": [...]}
 data: [DONE]
 ```
 

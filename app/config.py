@@ -43,7 +43,7 @@ class Settings(BaseSettings):
     AUDIT_LOG_PATH: Optional[Path] = None
 
     OLLAMA_BASE_URL: str = "http://127.0.0.1:11434"
-    LOCAL_MODEL: str = "qwen2.5:1.5b"
+    LOCAL_MODEL: str = "qwen2.5:3b"
     LOCAL_FALLBACK_MODEL: str = "qwen2.5:0.5b"
     EMBEDDING_MODEL: str = "nomic-embed-text"
     EMBEDDING_PROVIDER: Literal["auto", "ollama", "deterministic_hash"] = "auto"

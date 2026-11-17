@@ -99,7 +99,7 @@ Optimized specifically for resource-constrained consumer hardware (e.g. Intel Co
 - **Operating System**: Linux (Ubuntu 22.04+ / Debian 12+ recommended; macOS and WSL2 compatible).
 - **Python**: Version 3.12+ (tested up to 3.14).
 - **RAM**: Minimum 4 GB; 8 GB recommended for local LLM inference.
-- **Local LLM Engine**: [Ollama](https://ollama.com/) (e.g. `qwen2.5:1.5b`, `qwen2.5:3b`, or `llama3.2:1b`).
+- **Local LLM Engine**: [Ollama](https://ollama.com/) (e.g. `qwen2.5:3b`, `qwen2.5:7b`, or `llama3.2:3b`).
 
 ---
 
@@ -136,7 +136,7 @@ LOG_LEVEL=INFO
 
 # Ollama local inference
 OLLAMA_BASE_URL=http://127.0.0.1:11434
-LOCAL_MODEL=qwen2.5:1.5b
+LOCAL_MODEL=qwen2.5:3b
 
 # Optional Cloud API Failover (Gemini / OpenAI)
 CLOUD_ENABLED=false
@@ -157,7 +157,7 @@ SQLITE_PATH=./data/university_agent.db
 ollama serve &
 
 # Pull the lightweight academic local model
-ollama pull qwen2.5:1.5b
+ollama pull qwen2.5:3b
 ```
 
 ### 4. Seed Academic Workspace (Optional)

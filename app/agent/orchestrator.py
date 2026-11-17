@@ -988,7 +988,7 @@ class AcademicAgent:
             complexity_enum = TaskComplexity.HIGH
 
         accumulated_text = ""
-        model_name = getattr(self.settings, "LOCAL_MODEL", "qwen2.5:1.5b")
+        model_name = getattr(self.settings, "LOCAL_MODEL", "qwen2.5:3b")
         provider_name = "ollama"
         is_fallback = False
 
