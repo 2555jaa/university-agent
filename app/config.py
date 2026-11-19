@@ -228,7 +228,9 @@ class Settings(BaseSettings):
             if not self.CLOUD_BASE_URL or not self.CLOUD_MODEL:
                 raise ValueError("CLOUD_BASE_URL and CLOUD_MODEL are required when CLOUD_PROVIDER is 'custom'")
 
-        if self.CLOUD_API_KEY and "CLOUD_ENABLED" not in self.model_fields_set:
+        if self.APP_ENV != "testing" and self.CLOUD_API_KEY and not self.RESTRICT_TO_LOCAL:
+            object.__setattr__(self, "CLOUD_ENABLED", True)
+        elif self.CLOUD_API_KEY and "CLOUD_ENABLED" not in self.model_fields_set:
             object.__setattr__(self, "CLOUD_ENABLED", True)
 
         if self.CLOUD_ENABLED and not self.CLOUD_API_KEY:
@@ -237,7 +239,7 @@ class Settings(BaseSettings):
         return self
 
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=(str(PROJECT_ROOT / ".env"), ".env"),
         env_file_encoding="utf-8",
         env_prefix="",
         extra="ignore",

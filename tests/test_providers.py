@@ -586,4 +586,62 @@ async def test_cloud_provider_timeout_falls_back_to_local_ollama():
         assert "Local model response" in res.content
 
 
+@pytest.mark.asyncio
+async def test_cloud_routing_for_tutor_and_coder_when_unconstrained():
+    """Verify tutor and coder modes route to cloud when RESTRICT_TO_LOCAL=false and no RAG fencing applies."""
+    from app.config import Settings
+
+    local_mock = MockLocalProvider()
+    cloud_mock = MockCloudProvider(available=True)
+    cfg = Settings(APP_ENV="testing", CLOUD_ENABLED=True, CLOUD_API_KEY="sk-valid-key", RESTRICT_TO_LOCAL=False, _env_file=None)
+    router = ModelRouter(local_provider=local_mock, cloud_provider=cloud_mock, settings_obj=cfg)
+
+    # 1. Normal tutoring question routes to cloud when enabled
+    messages_tut = [LLMMessage(role="user", content="Explain how quicksort works.")]
+    target_tut = await router.route_query(messages=messages_tut, is_private=False, mode="tutor")
+    assert target_tut == "cloud"
+
+    # 2. Coding / debugging question routes to cloud when enabled
+    messages_code = [LLMMessage(role="user", content="Debug this function.")]
+    target_code = await router.route_query(messages=messages_code, is_private=False, mode="coder")
+    assert target_code == "cloud"
+
+    # 3. Explicit is_private=True still strictly forces local routing
+    target_private = await router.route_query(messages=messages_code, is_private=True, mode="coder")
+    assert target_private == "local"
+
+    # 4. Injected RAG context strictly forces local routing
+    rag_prompt = "<retrieved_context>Confidential course notes</retrieved_context> Fix the code"
+    messages_rag = [LLMMessage(role="user", content=rag_prompt)]
+    target_rag = await router.route_query(messages=messages_rag, is_private=False, mode="coder")
+    assert target_rag == "local"
+
+    # 5. RESTRICT_TO_LOCAL=True strictly forces local routing
+    router.settings.RESTRICT_TO_LOCAL = True
+    target_restricted = await router.route_query(messages=messages_code, is_private=False, mode="coder")
+    assert target_restricted == "local"
+
+
+@pytest.mark.asyncio
+async def test_system_health_endpoint_cloud_provider_status_ok(client, test_settings):
+    """Verify /api/system/health returns cloud_provider.status == 'ok' when key is present and cloud is available."""
+    test_settings.CLOUD_ENABLED = True
+    test_settings.CLOUD_API_KEY = "sk-test-health-key"
+
+    mock_resp = AsyncMock(status_code=200)
+    mock_resp.json = MagicMock(return_value={"data": []})
+    mock_client = AsyncMock()
+    mock_client.get.return_value = mock_resp
+    mock_client.__aenter__.return_value = mock_client
+
+    with patch("app.providers.cloud_provider.httpx.AsyncClient", return_value=mock_client):
+        res = client.get("/api/system/health")
+        data = res.json()
+        assert "cloud_provider" in data
+        assert data["cloud_provider"]["status"] == "ok"
+        assert data["cloud_provider"]["available"] is True
+        assert data["cloud_provider"]["enabled"] is True
+
+
+
 

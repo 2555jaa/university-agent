@@ -88,7 +88,8 @@ class ModelRouter:
         self,
         messages: List[Any],
         complexity: Optional[TaskComplexity] = None,
-        is_private: bool = True
+        is_private: bool = False,
+        mode: Optional[str] = None,
     ) -> str:
         """Determine target provider ("local" or "cloud") enforcing privacy guardrails and complexity."""
         # 1. Strict Privacy Guardrail: RESTRICT_TO_LOCAL setting
@@ -111,36 +112,42 @@ class ModelRouter:
             logger.debug("Routing to local: CLOUD_ENABLED is False.")
             return "local"
 
-        # 5. Evaluate task complexity
-        effective_complexity = complexity
-        if effective_complexity is None or effective_complexity == TaskComplexity.LOW:
-            effective_complexity = self.determine_complexity(messages, default=complexity or TaskComplexity.LOW)
-
-        if effective_complexity != TaskComplexity.HIGH:
-            logger.debug(f"Routing to local: Task complexity is {effective_complexity}.")
-            return "local"
-
-        # 6. Check cloud provider readiness / API key availability
+        # 5. Check cloud provider readiness / API key availability
         if not await self.cloud_provider.is_available():
             logger.warning("Routing to local: Cloud provider is offline or missing API key.")
             return "local"
 
-        return "cloud"
+        # 6. Mode & Complexity evaluation:
+        # When cloud is enabled and unconstrained, do not block tutor or coder queries from cloud.
+        if mode in ("coder", "tutor", "research"):
+            return "cloud"
+
+        effective_complexity = complexity
+        if effective_complexity is None or effective_complexity == TaskComplexity.LOW:
+            effective_complexity = self.determine_complexity(messages, default=complexity or TaskComplexity.LOW)
+
+        if effective_complexity == TaskComplexity.HIGH:
+            return "cloud"
+
+        logger.debug(f"Routing to local: Task complexity is {effective_complexity}.")
+        return "local"
 
     async def route_and_generate(
         self,
         messages: List[LLMMessage],
         complexity: Optional[TaskComplexity] = None,
-        is_private: bool = True,
+        is_private: bool = False,
+        mode: Optional[str] = None,
         temperature: float = 0.7,
-        max_tokens: Optional[int] = 2048
+        max_tokens: Optional[int] = 2048,
     ) -> LLMResponse:
         """Route request according to security policies, cost controls, and failover gracefully."""
         normalized_messages = self._normalize_messages(messages)
         target_provider = await self.route_query(
             messages=normalized_messages,
             complexity=complexity,
-            is_private=is_private
+            is_private=is_private,
+            mode=mode,
         )
 
         if target_provider == "cloud":
@@ -193,16 +200,18 @@ class ModelRouter:
         self,
         messages: List[LLMMessage],
         complexity: Optional[TaskComplexity] = None,
-        is_private: bool = True,
+        is_private: bool = False,
+        mode: Optional[str] = None,
         temperature: float = 0.7,
-        max_tokens: Optional[int] = 2048
+        max_tokens: Optional[int] = 2048,
     ):
         """Route request according to security policies and stream tokens."""
         normalized_messages = self._normalize_messages(messages)
         target_provider = await self.route_query(
             messages=normalized_messages,
             complexity=complexity,
-            is_private=is_private
+            is_private=is_private,
+            mode=mode,
         )
 
         if target_provider == "cloud" and hasattr(self.cloud_provider, "generate_stream"):

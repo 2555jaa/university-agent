@@ -160,7 +160,7 @@ def _migration_002_constraints_and_indexes(conn: sqlite3.Connection) -> None:
     conn.execute("""
     CREATE TABLE learning_sessions_new (
         id TEXT PRIMARY KEY,
-        session_type TEXT NOT NULL CHECK(session_type IN ('tutor', 'research', 'assignment', 'assistant', 'general')),
+        session_type TEXT NOT NULL CHECK(session_type IN ('tutor', 'research', 'assignment', 'assistant', 'general', 'coder')),
         title TEXT,
         started_at TEXT NOT NULL,
         ended_at TEXT,
@@ -894,7 +894,7 @@ class DatabaseManager:
         cleaned_type = session_type.strip().lower()
         if not cleaned_id:
             raise ValueError("Session ID cannot be empty.")
-        if cleaned_type not in ("tutor", "research", "assignment", "assistant", "general"):
+        if cleaned_type not in ("tutor", "research", "assignment", "assistant", "general", "coder"):
             raise ValueError(f"Invalid session_type '{session_type}'.")
 
         now = datetime.now(timezone.utc).isoformat()

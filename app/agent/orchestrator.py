@@ -13,11 +13,13 @@ from pydantic import BaseModel, Field, model_validator
 from app.config import settings
 from app.agent.prompts import (
     TUTORING_PROMPT,
+    CODING_DEBUGGER_PROMPT,
     SUMMARIZATION_PROMPT,
     ASSIGNMENT_GUARDRAIL_PROMPT,
     DEFAULT_RESEARCH_PROMPT,
     QUIZ_GENERATOR_PROMPT,
     TUTOR_SYSTEM_PROMPT,
+    CODER_SYSTEM_PROMPT,
     RESEARCH_SYSTEM_PROMPT,
     ASSIGNMENT_PLANNER_SYSTEM_PROMPT,
     GENERAL_ASSISTANT_SYSTEM_PROMPT,
@@ -43,6 +45,7 @@ logger = logging.getLogger("university_agent.agent.orchestrator")
 
 class AcademicIntent(str, Enum):
     TUTORING = "TUTORING"
+    CODING_DEBUGGER = "CODING_DEBUGGER"
     SUMMARIZATION = "SUMMARIZATION"
     ASSIGNMENT_ASSISTANCE = "ASSIGNMENT_ASSISTANCE"
     DEFAULT_QA = "DEFAULT_QA"
@@ -94,6 +97,26 @@ def classify_academic_intent(query: str) -> AcademicIntent:
     for pat in summarization_patterns:
         if re.search(pat, text):
             return AcademicIntent.SUMMARIZATION
+
+    # Priority 3: Coding & Bug-Fixing / Debugger
+    coding_patterns = [
+        r'\bdebug\b',
+        r'\bfix(?:ing)? (?:a |the |this )?(?:bug|error|code|issue)\b',
+        r'\bbug in\b',
+        r'\btraceback\b',
+        r'\bsyntaxerror\b',
+        r'\bruntimeerror\b',
+        r'\bindexerror\b',
+        r'\btypeerror\b',
+        r'\bsegmentation fault\b',
+        r'\bstack ?trace\b',
+        r'\binspect (?:the )?(?:workspace|file|code)\b',
+        r'\brefactor\b',
+        r'\bunit test\b',
+    ]
+    for pat in coding_patterns:
+        if re.search(pat, text):
+            return AcademicIntent.CODING_DEBUGGER
 
     # Priority 3: Tutoring / Socratic explanation
     tutoring_patterns = [
@@ -422,13 +445,13 @@ class AgentQueryRequest(BaseModel):
     message: str
     messages: Optional[List[Dict[str, Any]]] = None
     session_id: Optional[str] = None
-    mode: str = "tutor"  # "tutor", "research", "assignment", "assistant"
+    mode: str = "tutor"  # "tutor", "coder", "research", "assignment", "assistant"
     subject: Optional[str] = None
     subject_id: Optional[str] = None
     topic_id: Optional[str] = None
     use_rag: bool = True
     use_tools: bool = True
-    is_private: bool = True
+    is_private: bool = False
     complexity: str = "low"  # "low", "medium", "high"
     stream: bool = True
 
@@ -615,10 +638,15 @@ class AcademicAgent:
 
     def _get_system_prompt(self, mode: Optional[str] = None, intent: Optional[AcademicIntent] = None) -> str:
         """Dynamically select tailored system prompt based on classified intent and operational mode."""
+        if mode == "coder":
+            return CODING_DEBUGGER_PROMPT
+
         if intent == AcademicIntent.ASSIGNMENT_ASSISTANCE:
             return ASSIGNMENT_GUARDRAIL_PROMPT
         elif intent == AcademicIntent.SUMMARIZATION:
             return SUMMARIZATION_PROMPT
+        elif intent == AcademicIntent.CODING_DEBUGGER:
+            return CODING_DEBUGGER_PROMPT
         elif intent == AcademicIntent.TUTORING:
             return TUTORING_PROMPT
         elif intent == AcademicIntent.DEFAULT_QA:
@@ -626,6 +654,8 @@ class AcademicAgent:
 
         if mode == "tutor":
             return TUTORING_PROMPT
+        elif mode == "coder":
+            return CODING_DEBUGGER_PROMPT
         elif mode == "research":
             return DEFAULT_RESEARCH_PROMPT
         elif mode == "assignment":
@@ -652,7 +682,10 @@ class AcademicAgent:
             )
 
         # 1. Intent classification & RAG Retrieval
-        intent = self.classify_intent(req.message)
+        if req.mode == "coder":
+            intent = AcademicIntent.CODING_DEBUGGER
+        else:
+            intent = self.classify_intent(req.message)
 
         grounded_ctx = GroundedContext(context_text="", citations=[], has_relevant_info=False)
         if req.use_rag:
@@ -714,6 +747,7 @@ class AcademicAgent:
                     messages=messages,
                     complexity=complexity_enum,
                     is_private=req.is_private,
+                    mode=req.mode,
                     temperature=0.6 if req.mode == "research" else 0.7
                 )
             reply_text = llm_res.content
@@ -829,6 +863,7 @@ class AcademicAgent:
                             messages=messages,
                             complexity=complexity_enum,
                             is_private=req.is_private,
+                            mode=req.mode,
                             temperature=0.6 if req.mode == "research" else 0.7
                         )
                     reply_text = llm_res.content
@@ -932,7 +967,10 @@ class AcademicAgent:
             )
 
         # 1. Intent classification & RAG Retrieval
-        intent = self.classify_intent(req.message)
+        if req.mode == "coder":
+            intent = AcademicIntent.CODING_DEBUGGER
+        else:
+            intent = self.classify_intent(req.message)
 
         grounded_ctx = GroundedContext(context_text="", citations=[], has_relevant_info=False)
         if req.use_rag:
@@ -999,6 +1037,7 @@ class AcademicAgent:
                         messages=messages,
                         complexity=complexity_enum,
                         is_private=req.is_private,
+                        mode=req.mode,
                         temperature=0.6 if req.mode == "research" else 0.7
                     )
                 elif hasattr(self.router, "local_provider") and hasattr(self.router.local_provider, "generate_stream"):
@@ -1011,6 +1050,7 @@ class AcademicAgent:
                         messages=messages,
                         complexity=complexity_enum,
                         is_private=req.is_private,
+                        mode=req.mode,
                         temperature=0.6 if req.mode == "research" else 0.7
                     )
                     model_name = res.model

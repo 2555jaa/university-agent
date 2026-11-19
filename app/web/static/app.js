@@ -356,7 +356,8 @@
         const intentClean = String(meta.intent).toUpperCase();
         const intentCls = intentClean.toLowerCase().includes("tutor") ? "tutoring"
           : intentClean.toLowerCase().includes("summar") ? "summarization"
-          : intentClean.toLowerCase().includes("assign") ? "assignment" : "";
+          : intentClean.toLowerCase().includes("assign") ? "assignment"
+          : intentClean.toLowerCase().includes("cod") ? "coding" : "";
         label.innerHTML += `<span class="intent-pill ${intentCls}">${escapeHtml(intentClean)}</span>`;
       }
       body.append(label);
@@ -550,7 +551,7 @@
           session_id: requestSession,
           mode,
           use_rag: true,
-          is_private: true,
+          is_private: false,
           stream: true
         })
       });
@@ -623,7 +624,8 @@
         const intentClean = String(intent).toUpperCase();
         const intentCls = intentClean.toLowerCase().includes("tutor") ? "tutoring"
           : intentClean.toLowerCase().includes("summar") ? "summarization"
-          : intentClean.toLowerCase().includes("assign") ? "assignment" : "";
+          : intentClean.toLowerCase().includes("assign") ? "assignment"
+          : intentClean.toLowerCase().includes("cod") ? "coding" : "";
         label.innerHTML += `<span class="intent-pill ${intentCls}">${escapeHtml(intentClean)}</span>`;
       }
 
@@ -1374,7 +1376,7 @@
         ["Embedding provider", `${embedding.provider || "unknown"} · ${embedding.model || "unknown"}`, null],
         ["Embedding type", embedding.is_neural ? "Semantic vectors" : "Lexical / hash fallback", embedding.is_neural],
         ["Vector index", `${index.total_documents ?? 0} documents · ${index.total_chunks ?? 0} chunks`, null],
-        ["Cloud routing", status.cloud_routing_enabled ? "Enabled" : "Disabled", null]
+        ["Cloud routing", status.cloud_routing_enabled ? "Enabled" : "Disabled", status.cloud_routing_enabled]
       ];
       container.replaceChildren();
       rows.forEach(([label, value, positive]) => {

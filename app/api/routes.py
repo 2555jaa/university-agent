@@ -103,6 +103,13 @@ async def health_check(request: Request):
             "available": cloud_ok,
             "model": s.CLOUD_MODEL,
         },
+        "cloud_provider": {
+            "status": "ok" if cloud_ok else ("disabled" if not s.CLOUD_ENABLED else "unavailable"),
+            "enabled": s.CLOUD_ENABLED,
+            "available": cloud_ok,
+            "provider": s.CLOUD_PROVIDER,
+            "model": s.CLOUD_MODEL,
+        },
         "llm_providers": {
             "ollama": {
                 "available": ollama_ok,
@@ -187,7 +194,7 @@ async def system_status(request: Request):
         "ollama_connected": ollama_ok,
         "available_local_models": loaded_models,
         "active_local_model": s.LOCAL_MODEL,
-        "cloud_routing_enabled": s.CLOUD_ENABLED,
+        "cloud_routing_enabled": s.CLOUD_ENABLED and not s.RESTRICT_TO_LOCAL,
         "vector_index": vec_status,
     }
 

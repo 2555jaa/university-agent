@@ -145,6 +145,35 @@ async def test_dynamic_persona_swapping_summarization_and_tutoring():
         assert "ACADEMIC RESEARCH ASSISTANT (Default Q&A)" in sys_qa
         assert res_qa.intent == "DEFAULT_QA"
 
+        # 4. Coder / Debugger mode
+        req_code = AgentQueryRequest(message="Fix the index error in my sort function", mode="coder", use_rag=False)
+        res_code = await agent.process_query(req_code)
+        sys_code = next(m.content for m in mock_route.call_args.kwargs["messages"] if m.role == "system")
+        assert "CODING & BUG-FIXING ASSISTANT (Debugger Mode)" in sys_code
+        assert res_code.intent == "CODING_DEBUGGER"
+
+
+def test_tutor_mode_upgraded_pedagogical_prompt():
+    """Verify tutor prompt contains pedagogical standards: intuition/analogy, steps, check-for-understanding, multilingual."""
+    from app.agent.prompts import TUTORING_PROMPT
+    assert "Intuition & Real-World Analogy First" in TUTORING_PROMPT
+    assert "Step-by-Step Breakdown" in TUTORING_PROMPT
+    assert "Clean Markdown Presentation" in TUTORING_PROMPT
+    assert "Check for Understanding" in TUTORING_PROMPT
+    assert "Multilingual Matching" in TUTORING_PROMPT
+
+
+def test_coder_mode_debugging_prompt_and_tools():
+    """Verify coder prompt emphasizes proactive workspace inspection and approval tokens."""
+    from app.agent.prompts import CODING_DEBUGGER_PROMPT
+    assert "Active Sandboxed Workspace Inspection" in CODING_DEBUGGER_PROMPT
+    assert "list_directory" in CODING_DEBUGGER_PROMPT
+    assert "read_file" in CODING_DEBUGGER_PROMPT
+    assert "write_file" in CODING_DEBUGGER_PROMPT
+    assert "execute_code" in CODING_DEBUGGER_PROMPT
+    assert "Root-Cause Diagnosis" in CODING_DEBUGGER_PROMPT
+    assert "approval token" in CODING_DEBUGGER_PROMPT.lower()
+
 
 def test_unclosed_think_tag_safely_extracted():
     """Verify that an unclosed <think> tag from truncated LLM output is safely parsed."""

@@ -40,7 +40,7 @@ class CloudProvider(BaseLLMProvider):
         settings_obj: Optional[Any] = None,
     ):
         self.settings = settings_obj or settings
-        self.api_key = api_key or getattr(self.settings, "CLOUD_API_KEY", None)
+        self.api_key = api_key if api_key is not None else getattr(self.settings, "CLOUD_API_KEY", None)
 
         if provider is not None:
             self.provider = provider.strip().lower()
@@ -88,7 +88,7 @@ class CloudProvider(BaseLLMProvider):
                 "error": "Cloud API key is missing (CLOUD_API_KEY is not configured).",
             })
         try:
-            async with httpx.AsyncClient(timeout=3.0) as client:
+            async with httpx.AsyncClient(timeout=5.0) as client:
                 res = await client.get(
                     f"{self.base_url}/models",
                     headers={"Authorization": f"Bearer {self.api_key}"},
