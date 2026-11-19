@@ -211,3 +211,57 @@ assert isolated_path.exists(), "lifespan startup must create isolated DATA_DIR"
     assert isolated.exists()
     after = development_db.stat().st_mtime_ns if development_db.exists() else None
     assert after == before
+
+
+@pytest.mark.parametrize(
+    "provider,expected_url,expected_model",
+    [
+        ("openai", "https://api.openai.com/v1", "gpt-4o-mini"),
+        ("gemini", "https://generativelanguage.googleapis.com/v1beta/openai", "gemini-2.5-flash"),
+        ("groq", "https://api.groq.com/openai/v1", "llama-3.3-70b-versatile"),
+        ("grok", "https://api.x.ai/v1", "grok-2-latest"),
+        ("openrouter", "https://openrouter.ai/api/v1", "openai/gpt-4o-mini"),
+    ],
+)
+def test_cloud_provider_presets_resolution(provider, expected_url, expected_model):
+    """Verify each preset resolves to the correct default base_url and model."""
+    cfg = Settings(CLOUD_PROVIDER=provider, _env_file=None)
+    assert cfg.CLOUD_BASE_URL == expected_url
+    assert cfg.CLOUD_MODEL == expected_model
+
+
+def test_cloud_provider_explicit_overrides_take_precedence():
+    """Verify explicit CLOUD_BASE_URL and CLOUD_MODEL overrides take precedence over presets."""
+    cfg = Settings(
+        CLOUD_PROVIDER="groq",
+        CLOUD_BASE_URL="https://custom.groq.proxy/v1",
+        CLOUD_MODEL="llama-3.1-8b-instant",
+        _env_file=None,
+    )
+    assert cfg.CLOUD_BASE_URL == "https://custom.groq.proxy/v1"
+    assert cfg.CLOUD_MODEL == "llama-3.1-8b-instant"
+
+
+def test_custom_provider_validation():
+    """Verify custom provider requires explicit CLOUD_BASE_URL and CLOUD_MODEL."""
+    with pytest.raises(ValidationError, match="custom"):
+        Settings(CLOUD_PROVIDER="custom", _env_file=None)
+
+    with pytest.raises(ValidationError, match="custom"):
+        Settings(CLOUD_PROVIDER="custom", CLOUD_BASE_URL="https://custom.llm/v1", _env_file=None)
+
+    cfg = Settings(
+        CLOUD_PROVIDER="custom",
+        CLOUD_BASE_URL="https://custom.llm/v1",
+        CLOUD_MODEL="my-custom-model",
+        _env_file=None,
+    )
+    assert cfg.CLOUD_BASE_URL == "https://custom.llm/v1"
+    assert cfg.CLOUD_MODEL == "my-custom-model"
+
+
+def test_invalid_cloud_provider_rejected():
+    """Verify unsupported CLOUD_PROVIDER names are rejected by validation."""
+    with pytest.raises(ValidationError, match="CLOUD_PROVIDER"):
+        Settings(CLOUD_PROVIDER="anthropic_direct", _env_file=None)
+

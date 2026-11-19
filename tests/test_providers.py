@@ -14,7 +14,7 @@ from app.providers.ollama_provider import (
     StreamInterruptedError,
     DEFAULT_OLLAMA_TIMEOUT,
 )
-from app.providers.cloud_provider import CloudAIProvider
+from app.providers.cloud_provider import CloudAIProvider, CloudProvider
 
 
 class MockLocalProvider(BaseLLMProvider):
@@ -426,5 +426,164 @@ async def test_cloud_provider_health_check_and_cost_controls():
         call_kwargs = mock_client.post.call_args.kwargs
         assert call_kwargs["json"]["max_tokens"] == 500
         assert call_kwargs["headers"]["Authorization"] == "Bearer sk-test-key-123"
+
+
+@pytest.mark.parametrize(
+    "provider_name,expected_url,expected_model",
+    [
+        ("openai", "https://api.openai.com/v1", "gpt-4o-mini"),
+        ("gemini", "https://generativelanguage.googleapis.com/v1beta/openai", "gemini-2.5-flash"),
+        ("groq", "https://api.groq.com/openai/v1", "llama-3.3-70b-versatile"),
+        ("grok", "https://api.x.ai/v1", "grok-2-latest"),
+        ("openrouter", "https://openrouter.ai/api/v1", "openai/gpt-4o-mini"),
+    ],
+)
+def test_cloud_provider_presets_resolution_in_provider(provider_name, expected_url, expected_model):
+    """Verify CloudProvider correctly auto-resolves base_url and model from provider preset."""
+    provider = CloudProvider(provider=provider_name)
+    assert provider.base_url == expected_url
+    assert provider.model == expected_model
+
+
+def test_cloud_provider_explicit_overrides_in_provider():
+    """Verify CloudProvider constructor explicit overrides take precedence."""
+    provider = CloudProvider(
+        provider="groq",
+        base_url="https://my-proxy.com/v1",
+        model="custom-llama-model",
+    )
+    assert provider.base_url == "https://my-proxy.com/v1"
+    assert provider.model == "custom-llama-model"
+
+
+@pytest.mark.asyncio
+async def test_cloud_provider_health_check_disabled_and_ok():
+    """Verify health_check() returns 'disabled' when no key is set and 'ok' when configured & reachable."""
+    from app.config import Settings
+
+    # 1. No key configured -> 'disabled'
+    cfg_disabled = Settings(APP_ENV="testing", CLOUD_ENABLED=False, CLOUD_API_KEY=None, _env_file=None)
+    provider_no_key = CloudProvider(api_key="", settings_obj=cfg_disabled)
+    res_disabled = await provider_no_key.health_check()
+    assert res_disabled == "disabled"
+    assert res_disabled["status"] == "disabled"
+    assert res_disabled["healthy"] is False
+
+    # 2. Key configured and HTTP 200 -> 'ok'
+    cfg_ok = Settings(APP_ENV="testing", CLOUD_ENABLED=True, CLOUD_API_KEY="sk-active-key", _env_file=None)
+    provider_ok = CloudProvider(api_key="sk-active-key", settings_obj=cfg_ok)
+
+    mock_resp = AsyncMock(status_code=200)
+    mock_client = AsyncMock()
+    mock_client.get.return_value = mock_resp
+    mock_client.__aenter__.return_value = mock_client
+
+    with patch("app.providers.cloud_provider.httpx.AsyncClient", return_value=mock_client):
+        res_ok = await provider_ok.health_check()
+        assert res_ok == "ok"
+        assert res_ok["status"] == "ok"
+        assert res_ok["healthy"] is True
+        mock_client.get.assert_called_once_with(
+            f"{provider_ok.base_url}/models",
+            headers={"Authorization": "Bearer sk-active-key"},
+        )
+
+
+@pytest.mark.asyncio
+async def test_cloud_provider_stream():
+    """Verify CloudProvider stream() parses SSE tokens properly."""
+    provider = CloudProvider(api_key="sk-stream-key", provider="groq")
+    provider.settings.CLOUD_ENABLED = True
+
+    sse_lines = [
+        'data: {"choices": [{"delta": {"content": "Deep"}, "finish_reason": null}]}',
+        'data: {"choices": [{"delta": {"content": " learning"}, "finish_reason": null}]}',
+        'data: {"choices": [{"delta": {"content": " proof"}, "finish_reason": "stop"}]}',
+        'data: [DONE]',
+    ]
+    mock_resp = MockStreamResponse(status_code=200, lines=sse_lines)
+    mock_client = AsyncMock()
+    mock_client.stream = MagicMock(return_value=mock_resp)
+    mock_client.__aenter__.return_value = mock_client
+
+    with patch("app.providers.cloud_provider.httpx.AsyncClient", return_value=mock_client):
+        chunks = []
+        async for chunk in provider.stream(
+            messages=[LLMMessage(role="user", content="Explain deep learning")]
+        ):
+            chunks.append(chunk)
+
+    assert len(chunks) == 4
+    assert chunks[0]["response"] == "Deep"
+    assert chunks[1]["response"] == " learning"
+    assert chunks[2]["response"] == " proof"
+    assert chunks[2]["done"] is True
+    assert chunks[3]["done"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status_code", [401, 500])
+async def test_cloud_provider_http_error_falls_back_to_local_ollama(status_code):
+    """Verify CloudProvider HTTP 401/500 errors gracefully trigger router fallback to local Ollama."""
+    from app.config import Settings
+
+    local_mock = MockLocalProvider()
+    cfg = Settings(APP_ENV="testing", CLOUD_ENABLED=True, CLOUD_API_KEY="sk-failing-key", _env_file=None)
+    cfg.RESTRICT_TO_LOCAL = False
+    cloud_failing = CloudProvider(api_key="sk-failing-key", settings_obj=cfg)
+
+    # Mock is_available() so router attempts cloud routing
+    cloud_failing.is_available = AsyncMock(return_value=True)
+
+    mock_error_resp = AsyncMock(status_code=status_code, text=f"Error {status_code} from Cloud")
+    mock_client = AsyncMock()
+    mock_client.post.return_value = mock_error_resp
+    mock_client.__aenter__.return_value = mock_client
+
+    router = ModelRouter(local_provider=local_mock, cloud_provider=cloud_failing, settings_obj=cfg)
+
+    with patch("app.providers.cloud_provider.httpx.AsyncClient", return_value=mock_client):
+        messages = [LLMMessage(role="user", content="Calculate polynomial bounds.")]
+        res = await router.route_and_generate(
+            messages=messages,
+            complexity=TaskComplexity.HIGH,
+            is_private=False,
+        )
+
+        assert res.provider == "ollama"
+        assert res.is_fallback is True
+        assert "Local model response" in res.content
+
+
+@pytest.mark.asyncio
+async def test_cloud_provider_timeout_falls_back_to_local_ollama():
+    """Verify CloudProvider timeout gracefully triggers router fallback to local Ollama."""
+    from app.config import Settings
+
+    local_mock = MockLocalProvider()
+    cfg = Settings(APP_ENV="testing", CLOUD_ENABLED=True, CLOUD_API_KEY="sk-timeout-key", _env_file=None)
+    cfg.RESTRICT_TO_LOCAL = False
+    cloud_timeout = CloudProvider(api_key="sk-timeout-key", settings_obj=cfg)
+
+    cloud_timeout.is_available = AsyncMock(return_value=True)
+
+    mock_client = AsyncMock()
+    mock_client.post.side_effect = httpx.ReadTimeout("Cloud read timeout")
+    mock_client.__aenter__.return_value = mock_client
+
+    router = ModelRouter(local_provider=local_mock, cloud_provider=cloud_timeout, settings_obj=cfg)
+
+    with patch("app.providers.cloud_provider.httpx.AsyncClient", return_value=mock_client):
+        messages = [LLMMessage(role="user", content="Complex proof")]
+        res = await router.route_and_generate(
+            messages=messages,
+            complexity=TaskComplexity.HIGH,
+            is_private=False,
+        )
+
+        assert res.provider == "ollama"
+        assert res.is_fallback is True
+        assert "Local model response" in res.content
+
 
 

@@ -15,6 +15,32 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 VALID_ENVS = ("development", "testing", "production")
 
 
+CLOUD_PROVIDER_PRESETS: dict[str, dict[str, str]] = {
+    "openai": {
+        "base_url": "https://api.openai.com/v1",
+        "default_model": "gpt-4o-mini",
+    },
+    "gemini": {
+        "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
+        "default_model": "gemini-2.5-flash",
+    },
+    "groq": {
+        "base_url": "https://api.groq.com/openai/v1",
+        "default_model": "llama-3.3-70b-versatile",
+    },
+    "grok": {
+        "base_url": "https://api.x.ai/v1",
+        "default_model": "grok-2-latest",
+    },
+    "openrouter": {
+        "base_url": "https://openrouter.ai/api/v1",
+        "default_model": "openai/gpt-4o-mini",
+    },
+}
+
+VALID_CLOUD_PROVIDERS = tuple(CLOUD_PROVIDER_PRESETS.keys()) + ("custom",)
+
+
 def _inside(path: Path, parent: Path) -> bool:
     """Return whether path is parent or a descendant of parent."""
     try:
@@ -57,10 +83,10 @@ class Settings(BaseSettings):
     MAX_CONTEXT_TOKENS: int = 4000
 
     CLOUD_ENABLED: bool = False
-    CLOUD_PROVIDER: Literal["gemini", "openai"] = "gemini"
+    CLOUD_PROVIDER: str = "openai"
     CLOUD_API_KEY: Optional[str] = Field(default=None, repr=False)
-    CLOUD_BASE_URL: str = "https://generativelanguage.googleapis.com/v1beta/openai"
-    CLOUD_MODEL: str = "gemini-2.5-flash"
+    CLOUD_BASE_URL: Optional[str] = None
+    CLOUD_MODEL: Optional[str] = None
 
     LOG_LEVEL: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
     RESTRICT_TO_LOCAL: bool = True
@@ -76,6 +102,15 @@ class Settings(BaseSettings):
             if normalized in VALID_ENVS:
                 return normalized
         raise ValueError(f"APP_ENV must be one of: {', '.join(VALID_ENVS)}")
+
+    @field_validator("CLOUD_PROVIDER", mode="before")
+    @classmethod
+    def validate_cloud_provider(cls, value: Any) -> str:
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in VALID_CLOUD_PROVIDERS:
+                return normalized
+        raise ValueError(f"CLOUD_PROVIDER must be one of: {', '.join(VALID_CLOUD_PROVIDERS)}")
 
     @field_validator("DEBUG", mode="before")
     @classmethod
@@ -181,6 +216,21 @@ class Settings(BaseSettings):
                         raise ValueError(f"Testing {name} must be isolated from development and production data")
             object.__setattr__(self, name, value)
 
+        # Auto-resolve CLOUD_BASE_URL and CLOUD_MODEL based on CLOUD_PROVIDER
+        provider = self.CLOUD_PROVIDER
+        if provider in CLOUD_PROVIDER_PRESETS:
+            preset = CLOUD_PROVIDER_PRESETS[provider]
+            if not self.CLOUD_BASE_URL:
+                object.__setattr__(self, "CLOUD_BASE_URL", preset["base_url"])
+            if not self.CLOUD_MODEL:
+                object.__setattr__(self, "CLOUD_MODEL", preset["default_model"])
+        elif provider == "custom":
+            if not self.CLOUD_BASE_URL or not self.CLOUD_MODEL:
+                raise ValueError("CLOUD_BASE_URL and CLOUD_MODEL are required when CLOUD_PROVIDER is 'custom'")
+
+        if self.CLOUD_API_KEY and "CLOUD_ENABLED" not in self.model_fields_set:
+            object.__setattr__(self, "CLOUD_ENABLED", True)
+
         if self.CLOUD_ENABLED and not self.CLOUD_API_KEY:
             raise ValueError("CLOUD_API_KEY is required when CLOUD_ENABLED=true")
 
@@ -226,4 +276,11 @@ def get_settings(env_override: Optional[str] = None, **overrides) -> Settings:
 # Kept for existing modules. No filesystem side effects occur at import time.
 settings = Settings()
 
-__all__ = ["Settings", "get_settings", "settings", "PROJECT_ROOT"]
+__all__ = [
+    "Settings",
+    "get_settings",
+    "settings",
+    "PROJECT_ROOT",
+    "CLOUD_PROVIDER_PRESETS",
+    "VALID_CLOUD_PROVIDERS",
+]

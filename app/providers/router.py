@@ -8,7 +8,7 @@ from typing import Any, List, Optional, Union
 from app.config import settings
 from app.providers.base import BaseLLMProvider, LLMMessage, LLMResponse
 from app.providers.ollama_provider import OllamaProvider
-from app.providers.cloud_provider import CloudAIProvider
+from app.providers.cloud_provider import CloudAIProvider, CloudProvider
 
 logger = logging.getLogger("university_agent.providers.router")
 

@@ -1,4 +1,4 @@
-# 🎓 Local University AI Agent
+#  Local University AI Agent
 
 [![Python 3.12](https://img.shields.io/badge/python-3.12-blue.svg)](https://www.python.org/downloads/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.135-009688.svg)](https://fastapi.tiangolo.com/)
@@ -48,7 +48,7 @@ Optimized specifically for resource-constrained consumer hardware (e.g. Intel Co
 
 ---
 
-## ✨ Key Features
+##  Key Features
 
 1. **Real-Time SSE Streaming Chat & Collapsible Reasoning Paths**:
    - Streams assistant tokens via Server-Sent Events (`POST /api/chat` and `/v1/chat/completions`).
@@ -94,7 +94,7 @@ Optimized specifically for resource-constrained consumer hardware (e.g. Intel Co
 
 ---
 
-## 💻 Hardware & System Requirements
+##  Hardware & System Requirements
 
 - **Operating System**: Linux (Ubuntu 22.04+ / Debian 12+ recommended; macOS and WSL2 compatible).
 - **Python**: Version 3.12+ (tested up to 3.14).
@@ -103,7 +103,7 @@ Optimized specifically for resource-constrained consumer hardware (e.g. Intel Co
 
 ---
 
-## 🚀 Quickstart Guide
+##  Quickstart Guide
 
 ### 1. Clone & Set Up Environment
 
@@ -188,7 +188,7 @@ The service is available at:
 
 ---
 
-## 🌐 Connecting Open WebUI
+##  Connecting Open WebUI
 
 To use the agent inside [Open WebUI](https://github.com/open-webui/open-webui):
 
@@ -209,7 +209,7 @@ To use the agent inside [Open WebUI](https://github.com/open-webui/open-webui):
 
 ---
 
-## 📚 Example API Usage
+##  Example API Usage
 
 ### 1. Check System Health & Diagnostics
 ```bash
@@ -267,7 +267,7 @@ curl -X POST http://127.0.0.1:8000/api/agent/quiz/evaluate \
 
 ---
 
-## 🧪 Testing & Verification
+##  Testing & Verification
 
 Run the full automated test suite containing unit, integration, RAG, and security tests:
 
@@ -286,6 +286,6 @@ All 198 automated tests run against an isolated sandbox environment ensuring zer
 
 ---
 
-## 📄 License
+##  License
 
-This project is licensed under the MIT License. See [LICENSE](LICENSE) for details.
+This project is licensed under the MIC License. See [LICENSE](LICENSE) for details.
